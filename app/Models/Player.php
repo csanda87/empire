@@ -10,6 +10,7 @@ class Player extends Model
         'game_id',
         'user_id',
         'name',
+        'color',
         'cash',
         'position',
         'is_bankrupt',
@@ -18,5 +19,25 @@ class Player extends Model
     public function game()
     {
         return $this->belongsTo(Game::class);
+    }
+
+    public function getColors()
+    {
+        return [
+            'amber',
+            'blue',
+            'cyan',
+            'emerald',
+            'green',
+            'indigo',
+            'lime',
+            'pink',
+            'purple',
+            'red',
+            'rose',
+            'sky',
+            'teal',
+            'yellow',
+        ];
     }
 }

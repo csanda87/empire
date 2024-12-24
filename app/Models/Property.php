@@ -21,7 +21,7 @@ class Property extends Model
         'rent_three_unit',
         'rent_four_unit',
         'rent_five_unit',
-        'house_price',
+        'unit_price',
     ];
 
     public function board()

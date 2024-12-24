@@ -17,6 +17,7 @@ return new class extends Migration
             $table->foreignId('game_id')->constrained();
             $table->foreignId('user_id')->constrained();
             $table->string('name');
+            $table->string('color');
             $table->unsignedInteger('cash')->default(0);
             $table->unsignedInteger('position')->default(0);
             $table->unsignedInteger('is_bankrupt')->default(0);

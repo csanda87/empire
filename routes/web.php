@@ -14,7 +14,16 @@ Route::get('/dashboard', function () {
 
 Route::middleware('auth')->group(function () {
     Route::get('/play/{invite_code}', function ($invite_code) {
-        return App\Models\Game::with('board.properties', 'players')->where('invite_code', $invite_code)->firstOrFail();
+        $game = App\Models\Game::query()
+            ->has('board.properties')
+            ->has('players')
+            ->with('board.properties', 'players')
+            ->where('invite_code', $invite_code)
+            ->firstOrFail();
+        // return $game->players->pluck('position', 'id');
+        return view('play', [
+            'game' => $game,
+        ]);
     });
 
     Route::resource('/games', GameController::class)->only(['index', 'create', 'store', 'show']);

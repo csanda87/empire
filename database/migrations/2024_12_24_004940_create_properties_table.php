@@ -28,7 +28,7 @@ return new class extends Migration
             $table->integer('rent_three_unit')->nullable();
             $table->integer('rent_four_unit')->nullable();
             $table->integer('rent_five_unit')->nullable();
-            $table->integer('house_price')->nullable();
+            $table->integer('unit_price')->nullable();
             // SQLite doesnt support setting default values for timestamps
             $table->timestamp('created_at')->default(DB::raw('CURRENT_TIMESTAMP'));
             $table->timestamp('updated_at')->default(DB::raw('CURRENT_TIMESTAMP'));
