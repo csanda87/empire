@@ -24,6 +24,7 @@ Route::middleware('auth')->group(function () {
                 'turns.transactions.items.fromPlayer:id,name,color',
                 'turns.transactions.items.toPlayer:id,name,color',
                 'turns.player:id,name,color',
+                'turns.rolls',
             )
             ->where('invite_code', $invite_code)
             ->firstOrFail();

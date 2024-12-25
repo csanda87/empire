@@ -16,6 +16,11 @@ class Turn extends Model
         return $this->belongsTo(Player::class);
     }
 
+    public function rolls()
+    {
+        return $this->hasMany(Roll::class);
+    }
+
     public function transactions()
     {
         return $this->hasMany(Transaction::class);

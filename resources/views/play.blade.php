@@ -95,13 +95,23 @@
                                             <span class="bg-{{ $turn->player->color }}-700 inline-block size-6 rounded-full ring-1 ring-white"></span>
                                             {{ $turn->player->name }}
                                             <hr>
+                                            @if ($turn->rolls->count())
+                                                <h3>Rolls</h3>
+                                                @foreach ($turn->rolls as $roll)
+                                                    @foreach ($roll->dice as $dice)
+                                                        <p>{{ 'Dice ' . $loop->iteration . ': ' . $dice }}</p>
+                                                    @endforeach
+                                                    <br>
+                                                @endforeach
+                                            @endif
+                                            <hr>
                                             @if ($turn->transactions->count())    
                                                 @foreach ($turn->transactions as $transaction)
                                                     {{ $transaction->status }}
                                                     <hr>
                                                     @if ($transaction->items->count())
                                                         @foreach ($transaction->items as $item)
-                                                            {{ $item->type }} <br>
+                                                            {{-- {{ $item->type }} <br> --}}
                                                             {{ $item->amount }} <br>
                                                             {{ $item->item->title }} <br>
                                                             From: {{ $item->fromPlayer->name }} <br>
