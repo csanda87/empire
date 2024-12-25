@@ -65,7 +65,7 @@
                                             <p style="background: {{ $space['color'] }}">&nbsp;</p>
                                             <div class="p-4">
                                                 <p>{{ $space['title'] }}</p>
-                                                <p class="mt-4"{{ $space['price'] }}</p>
+                                                <p class="mt-4">{{ $space['price'] }}</p>
                                             </div>
                                             <div class="px-4 py-2">
                                                 <div class="flex -space-x-1">
@@ -81,6 +81,40 @@
                                 @endforeach
                             </div>
                         @endforeach
+                    </div>
+                    <div class="mt-4">
+                        <div class="flex gap-4">
+                            <div class="w-full sm:w-1/2">
+                                Players State
+                            </div>
+                            <div class="w-full sm:w-1/2">
+                                <h3>Turns</h3>
+                                <ol class="list-decimal list-inside">
+                                    @foreach ($game->turns as $turn)
+                                        <li>
+                                            <span class="bg-{{ $turn->player->color }}-700 inline-block size-6 rounded-full ring-1 ring-white"></span>
+                                            {{ $turn->player->name }}
+                                            <hr>
+                                            @if ($turn->transactions->count())    
+                                                @foreach ($turn->transactions as $transaction)
+                                                    {{ $transaction->status }}
+                                                    <hr>
+                                                    @if ($transaction->items->count())
+                                                        @foreach ($transaction->items as $item)
+                                                            {{ $item->type }} <br>
+                                                            {{ $item->amount }} <br>
+                                                            {{ $item->item->title }} <br>
+                                                            From: {{ $item->fromPlayer->name }} <br>
+                                                            To: {{ $item->toPlayer->name }} <br>
+                                                        @endforeach
+                                                    @endif
+                                                @endforeach
+                                            @endif
+                                        </li>
+                                    @endforeach
+                                </ol>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>

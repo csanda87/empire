@@ -21,4 +21,14 @@ class Game extends Model
     {
         return $this->hasMany(Player::class);
     }
+
+    public function transactions()
+    {
+        return $this->hasMany(Transaction::class);
+    }
+
+    public function turns()
+    {
+        return $this->hasMany(Turn::class);
+    }
 }

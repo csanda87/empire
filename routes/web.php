@@ -17,10 +17,17 @@ Route::middleware('auth')->group(function () {
         $game = App\Models\Game::query()
             ->has('board.properties')
             ->has('players')
-            ->with('board.properties', 'players')
+            ->with(
+                'board.properties',
+                'players',
+                'turns.transactions.items.item',
+                'turns.transactions.items.fromPlayer:id,name,color',
+                'turns.transactions.items.toPlayer:id,name,color',
+                'turns.player:id,name,color',
+            )
             ->where('invite_code', $invite_code)
             ->firstOrFail();
-        // return $game->players->pluck('position', 'id');
+
         return view('play', [
             'game' => $game,
         ]);

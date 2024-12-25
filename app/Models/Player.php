@@ -20,24 +20,4 @@ class Player extends Model
     {
         return $this->belongsTo(Game::class);
     }
-
-    public function getColors()
-    {
-        return [
-            'amber',
-            'blue',
-            'cyan',
-            'emerald',
-            'green',
-            'indigo',
-            'lime',
-            'pink',
-            'purple',
-            'red',
-            'rose',
-            'sky',
-            'teal',
-            'yellow',
-        ];
-    }
 }
