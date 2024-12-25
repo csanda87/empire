@@ -14,12 +14,12 @@ Route::get('/dashboard', function () {
 
 Route::middleware('auth')->group(function () {
     Route::get('/play/{invite_code}', function ($invite_code) {
-        $game = App\Models\Game::query()
+        return $game = App\Models\Game::query()
             ->has('board.properties')
             ->has('players')
             ->with(
                 'board.properties',
-                'players',
+                'players.assets.item',
                 'turns.transactions.items.item',
                 'turns.transactions.items.fromPlayer:id,name,color',
                 'turns.transactions.items.toPlayer:id,name,color',

@@ -22,7 +22,7 @@ class TransactionItem extends Model
         return match ($this->type) {
             'property' => $this->belongsTo(Property::class, 'item_id'),
             // 'card' => $this->belongsTo(Card::class, 'item_id'),
-            default => $this->belongsTo(Property::class, 'item_id')->withDefault(['title' => 'Cash']),
+            default => $this->belongsTo(static::class, 'item_id')->withDefault(['title' => 'Cash']),
         };
     }
 

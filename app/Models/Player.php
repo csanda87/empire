@@ -16,6 +16,11 @@ class Player extends Model
         'is_bankrupt',
     ];
 
+    public function assets()
+    {
+        return $this->hasMany(PlayerAsset::class);
+    }
+
     public function game()
     {
         return $this->belongsTo(Game::class);
