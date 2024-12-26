@@ -85,7 +85,24 @@
                     <div class="mt-4">
                         <div class="flex gap-4">
                             <div class="w-full sm:w-1/2">
-                                Players State
+                                <h3>Players State</h3>
+                                @foreach ($game->players as $player)
+                                    <div class="mt-4">
+                                        <span class="bg-{{ $player->color }}-700 inline-block size-6 rounded-full ring-1 ring-white"></span>
+                                        <p>{{ $player->name }}</p>
+                                        <p>${{ $player->cash }}</p>
+                                        <h4 class="font-bold mt-4">Properties</h4>
+                                        @foreach ($player->assets->where('itemable_type', 'App\Models\Property') as $asset)
+                                            {{ $asset->itemable->title }}
+                                        @endforeach
+                                        @if ($player->assets->where('itemable_type', 'App\Models\Card')->count())
+                                            <h4 class="font-bold mt-4">Cards</h4>
+                                            @foreach ($player->assets->where('itemable_type', 'App\Models\Card') as $asset)
+                                                {{ $asset->itemable->message }}
+                                            @endforeach
+                                        @endif
+                                    </div>
+                                @endforeach
                             </div>
                             <div class="w-full sm:w-1/2">
                                 <h3>Turns</h3>
@@ -111,7 +128,6 @@
                                                     <hr>
                                                     @if ($transaction->items->count())
                                                         @foreach ($transaction->items as $item)
-                                                            {{-- {{ $item->type }} <br> --}}
                                                             {{ $item->amount }} <br>
                                                             {{ $item->item->title }} <br>
                                                             From: {{ $item->fromPlayer->name }} <br>
