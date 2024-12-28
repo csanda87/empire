@@ -12,7 +12,8 @@ Route::get('/', function () {
 });
 
 Route::get('/dashboard', function () {
-    return view('dashboard');
+    return redirect('/games');
+    // return view('dashboard');
 })->middleware(['auth', 'verified'])->name('dashboard');
 
 Route::middleware('auth')->group(function () {
@@ -31,13 +32,13 @@ Route::middleware('auth')->group(function () {
             )
             ->where('invite_code', $invite_code)
             ->firstOrFail();
-        // return $game->players[0]->assets;
+
         return view('play', [
             'game' => $game,
         ]);
     });
 
-    Route::resource('/games', GameController::class)->only(['index', 'create', 'store', 'show']);
+    Route::resource('/games', GameController::class)->only(['index', 'create', 'store']);
 
     Route::get('/profile', [ProfileController::class, 'edit'])->name('profile.edit');
     Route::patch('/profile', [ProfileController::class, 'update'])->name('profile.update');
