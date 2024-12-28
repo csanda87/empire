@@ -12,6 +12,7 @@
                     <div class="max-w-xl">
                         <a href="/play/{{ $game->invite_code }}">
                             <span class="block">Play Game</span>
+                            <span class="block">Status: {{ $game->status }}</span>
                             <span class="block">Invite Code: {{ $game->invite_code }}</span>
                             <span class="block">Board: {{ $game->board->name }}</span>
                             <span class="block">Players: {{ $game->players->count() }}</span>
