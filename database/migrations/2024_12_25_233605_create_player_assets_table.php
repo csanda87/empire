@@ -14,8 +14,8 @@ return new class extends Migration
         Schema::create('player_assets', function (Blueprint $table) {
             $table->id();
             $table->foreignId('player_id')->constrained();
-            $table->string('type'); // 'property', 'card',
-            $table->unsignedBigInteger('item_id');
+            $table->string('itemable_type'); // 'property', 'card',
+            $table->unsignedBigInteger('itemable_id');
             // $table->timestamps();
             $table->timestamp('created_at')->default(DB::raw('CURRENT_TIMESTAMP'));
             $table->timestamp('updated_at')->default(DB::raw('CURRENT_TIMESTAMP'));

@@ -1,5 +1,4 @@
-<div class="dark:text-white">
-    asdf
+<div class="text-center dark:text-white">
     <h1>{{ $count }}</h1>
  
     <button wire:click="increment">+</button>

@@ -17,10 +17,13 @@ return new class extends Migration
             $table->foreignId('board_id')->constrained();
             $table->string('status')->default('waiting');
             $table->string('invite_code')->unique();
+            $table->unsignedBigInteger('created_by')->nullable();
             // SQLite doesnt support setting default values for timestamps
             $table->timestamp('created_at')->default(DB::raw('CURRENT_TIMESTAMP'));
             $table->timestamp('updated_at')->default(DB::raw('CURRENT_TIMESTAMP'));
             // $table->timestamps();
+            
+            $table->foreign('created_by')->references('id')->on('users');
         });
     }
 
