@@ -53,7 +53,7 @@
                                                 <div class="flex -space-x-1">
                                                     @if ($game->players->where('position', $index + ($sideIndex * 10))->count())
                                                         @foreach ($game->players->where('position', $index + ($sideIndex * 10)) as $player)
-                                                            <span class="bg-{{ $player->color }}-700 inline-block size-6 rounded-full ring-1 ring-white"></span>
+                                                            <span class="{{ $pieceColors[$player->color] }} inline-block size-6 rounded-full ring-1 ring-white"></span>
                                                         @endforeach
                                                     @endif
                                                 </div>
@@ -70,7 +70,7 @@
                                                 <div class="flex -space-x-1">
                                                     @if ($game->players->where('position', $index + ($sideIndex * 10))->count())
                                                         @foreach ($game->players->where('position', $index + ($sideIndex * 10)) as $player)
-                                                            <span class="bg-{{ $player->color }}-700 inline-block size-6 rounded-full ring-1 ring-white"></span>
+                                                            <span class="{{ $pieceColors[$player->color] }} inline-block size-6 rounded-full ring-1 ring-white"></span>
                                                         @endforeach
                                                     @endif
                                                 </div>
