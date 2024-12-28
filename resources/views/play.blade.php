@@ -1,4 +1,4 @@
-<x-app-layout>
+<x-layouts.app>
     <x-slot name="header">
         <h2 class="font-semibold text-xl text-gray-800 dark:text-gray-200 leading-tight">
             Play
@@ -20,7 +20,6 @@
                             <p>{{ $game->board->description }}</p>
                         @endif
                     </div>
-                    <hr class="mt-4">
                     @php
                         $pieceColors = [
                             'amber' => 'bg-amber-700',
@@ -146,4 +145,4 @@
             </div>
         </div>
     </div>
-</x-app-layout>
+</x-layouts.app>
