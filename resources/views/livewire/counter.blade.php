@@ -5,3 +5,13 @@
  
     <button wire:click="decrement">-</button>
 </div>
+
+@script
+<script>
+    Echo.private(`play.123`)
+        .listen('DiceRolled', (e) => {
+            // console.log(e.order.name);
+            console.log('dice rolled');
+        });
+</script>
+@endscript

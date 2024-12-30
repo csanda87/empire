@@ -8,12 +8,16 @@ use App\Livewire\Counter;
 Route::get('/counter', Counter::class);
 
 Route::get('/', function () {
+    // $invite_code = '123';
+    // $game = App\Models\Game::with('players')->where('invite_code', $invite_code)->firstOrFail();
+    // dd($game->players->contains('user_id', 3));
+    App\Events\DiceRolled::dispatch();
     return view('welcome');
 });
 
 Route::get('/dashboard', function () {
-    return redirect('/games');
-    // return view('dashboard');
+    // return redirect('/games');
+    return view('dashboard');
 })->middleware(['auth', 'verified'])->name('dashboard');
 
 Route::middleware('auth')->group(function () {
