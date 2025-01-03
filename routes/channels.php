@@ -12,3 +12,9 @@ Broadcast::channel('play.{invite_code}', function ($user, $invite_code) {
     
     // return $game->players->contains('user_id', $user->id);
 });
+
+Broadcast::channel('chat.{roomId}', function ($user, $roomId) {
+    // if ($user->canJoinRoom($roomId)) {
+        return ['id' => $user->id, 'name' => $user->name];
+    // }
+});
