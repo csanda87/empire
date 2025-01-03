@@ -7,7 +7,8 @@ Broadcast::channel('App.Models.User.{id}', function ($user, $id) {
 });
 
 Broadcast::channel('play.{invite_code}', function ($user, $invite_code) {
-    $game = App\Models\Game::with('players')->where('invite_code', $invite_code)->firstOrFail();
+    return true;
+    // $game = App\Models\Game::with('players')->where('invite_code', $invite_code)->firstOrFail();
     
-    return $game->players->contains('user_id', $user->id);
+    // return $game->players->contains('user_id', $user->id);
 });

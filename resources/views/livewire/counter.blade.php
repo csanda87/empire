@@ -8,6 +8,7 @@
 
 @script
 <script>
+    console.log('hi from counter');
     Echo.private(`play.123`)
         .listen('DiceRolled', (e) => {
             // console.log(e.order.name);
