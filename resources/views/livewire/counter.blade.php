@@ -7,29 +7,21 @@
 
     <hr>
 
-    <button wire:click="broadcastThing">test</button>
+    <button @click="$dispatch('dice-rolled', { title: 'Post Title' })">test</button>
+    {{-- <button @click="alert('hi')">test2</button> --}}
+
+    {{-- <button wire:click="broadcastThing">test</button> --}}
 </div>
 
 @script
 <script>
+    document.addEventListener('livewire:init', () => {
+        console.log('hi from init');
+
+        // Runs after Livewire is loaded but before it's initialized
+        // on the page...
+    })
     console.log('hi from counter');
-    Echo.private(`play.123`)
-        .listen('DiceRolled', (e) => {
-            // console.log(e.order.name);
-            console.log('dice rolled');
-        });
-    Echo.join(`chat.123`)
-        .here((users) => {
-            console.log(users);
-        })
-        .joining((user) => {
-            console.log(user.name);
-        })
-        .leaving((user) => {
-            console.log(user.name);
-        })
-        .error((error) => {
-            console.error(error);
-        });
+    
 </script>
 @endscript

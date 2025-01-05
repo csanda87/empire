@@ -8,7 +8,7 @@ class Counter extends Component
 {
     public $count = 1;
 
-    public function broadcastThing()
+    public function DiceRolled()
     {
         \App\Events\DiceRolled::dispatch();
     }
