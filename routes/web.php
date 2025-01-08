@@ -7,6 +7,17 @@ use App\Livewire\Counter;
  
 Route::get('/counter', Counter::class);
 
+use Illuminate\Support\Facades\Broadcast;
+
+Broadcast::routes();
+
+Route::get('/test-reverb', function () {
+    return [
+        'connected' => app('reverb')->getHost() === env('REVERB_HOST', '127.0.0.1'),
+        'port' => env('REVERB_PORT', 6001),
+    ];
+});
+
 Route::get('/', function () {
     // $invite_code = '123';
     // $game = App\Models\Game::with('players')->where('invite_code', $invite_code)->firstOrFail();
