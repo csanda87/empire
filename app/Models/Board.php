@@ -6,7 +6,7 @@ use Illuminate\Database\Eloquent\Model;
 
 class Board extends Model
 {
-    protected $fillablle = [
+    protected $fillable = [
         'name',
         'description',
         'created_by',
