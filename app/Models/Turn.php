@@ -9,6 +9,7 @@ class Turn extends Model
     protected $fillable = [
         'game_id',
         'player_id',
+        'status',
     ];
 
     public function player()

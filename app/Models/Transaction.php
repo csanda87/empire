@@ -9,8 +9,6 @@ class Transaction extends Model
     protected $fillable = [
         'game_id',
         'turn_id',
-        'from_player_id',
-        'to_player_id',
         'status',
     ];
 
@@ -24,15 +22,7 @@ class Transaction extends Model
         return $this->hasMany(TransactionItem::class);
     }
 
-    public function fromPlayer()
-    {
-        return $this->belongsTo(Player::class, 'from_player_id');
-    }
-
-    public function toPlayer()
-    {
-        return $this->belongsTo(Player::class, 'to_player_id');
-    }
+    // Directional players are represented on items, not the parent transaction
 
     public function turn()
     {

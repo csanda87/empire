@@ -31,7 +31,7 @@ class Board extends Model
                 [
                     'title' => 'Go',
                     'type' => 'ActionSpace',
-                    'effect' => 'Collect::200',
+                    'effect' => 'Do::nothing',
                 ],
                 $properties->where('color', 'brown')->values()[0],
                 [
