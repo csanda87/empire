@@ -87,6 +87,11 @@ class Game extends Model
                     return $activePlayers->first();
                 }
 
+                // If the last rolled turn has not been completed yet, it is still that player's turn
+                if ($lastRolledTurn->status !== 'completed') {
+                    return $activePlayers->firstWhere('id', $lastRolledTurn->player_id) ?? $activePlayers->first();
+                }
+
                 // If last roller is now inactive/bankrupt, fall back to first active player
                 $lastIndex = $activePlayers->search(fn (Player $p) => $p->id === $lastRolledTurn->player_id);
                 if ($lastIndex === false) {

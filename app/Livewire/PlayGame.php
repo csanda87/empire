@@ -3,6 +3,7 @@
 namespace App\Livewire;
 
 use App\Events\DiceRolled;
+use App\Events\GameUpdated;
 use App\Models\Game;
 use App\Services\GameEngine;
 use Illuminate\Contracts\View\View as ViewContract;
@@ -12,6 +13,7 @@ class PlayGame extends Component
 {
     public string $inviteCode;
     public array $dice = [];
+    public ?string $landingMessage = null;
     public ?int $offerPropertyId = null;
     public ?int $tradeToPlayerId = null;
     public int $tradeCashAmount = 0;
@@ -26,6 +28,7 @@ class PlayGame extends Component
     {
         return [
             "echo-private:play.{$this->inviteCode},DiceRolled" => 'handleDiceRolled',
+            "echo-private:play.{$this->inviteCode},GameUpdated" => '$refresh',
         ];
     }
 
@@ -53,6 +56,7 @@ class PlayGame extends Component
         $result = $engine->rollAndAdvance($game, $player);
 
         $this->dice = $result['dice'] ?? [];
+        $this->landingMessage = $this->composeLandingMessage($result['space'] ?? null, $result['actions'] ?? [], $game->players);
 
         // Capture purchase offer if present
         foreach (($result['actions'] ?? []) as $action) {
@@ -67,6 +71,42 @@ class PlayGame extends Component
 
         // Re-render with fresh state
         $this->dispatch('$refresh');
+    }
+
+    // When a user buys or skips, we'll call resolvePendingDecision indirectly
+
+    protected function composeLandingMessage($space, array $actions, $players = null): ?string
+    {
+        if (!$space) {
+            return null;
+        }
+
+        // If rent was paid on landing, prefer a clear rent message
+        foreach ($actions as $action) {
+            if (($action['type'] ?? null) === 'rent_paid') {
+                $amount = (int) ($action['amount'] ?? 0);
+                $toId = (int) ($action['to'] ?? 0);
+                $toName = 'opponent';
+                if ($players) {
+                    $owner = $players->firstWhere('id', $toId);
+                    if ($owner) {
+                        $toName = $owner->name;
+                    }
+                }
+                $spaceTitle = is_array($space) ? ($space['title'] ?? 'a property') : 'a property';
+                return sprintf('You landed on %s and paid $%d to %s.', $spaceTitle, $amount, $toName);
+            }
+        }
+
+        if (is_array($space) && ($space['type'] ?? null) === 'Property') {
+            return sprintf('You landed on %s.', $space['title'] ?? 'a property');
+        }
+
+        if (is_array($space) && ($space['type'] ?? null) === 'ActionSpace') {
+            return sprintf('You landed on %s.', $space['title'] ?? 'an action space');
+        }
+
+        return 'You moved.';
     }
 
     public function buyProperty(GameEngine $engine): void
@@ -92,11 +132,34 @@ class PlayGame extends Component
         }
 
         $engine->purchaseProperty($game, $player, $property);
+        // After decision, advance turn status depending on last roll
+        $engine->resolvePendingDecision($game, $player);
         $this->offerPropertyId = null;
         $this->dispatch('$refresh');
+        broadcast(new GameUpdated($this->inviteCode, 'purchase'));
     }
 
-    public function executeTrade(GameEngine $engine): void
+    public function skipPurchase(GameEngine $engine): void
+    {
+        if (!$this->offerPropertyId) {
+            return;
+        }
+
+        $game = Game::query()
+            ->with('players')
+            ->where('invite_code', $this->inviteCode)
+            ->firstOrFail();
+
+        $player = $game->players()->where('user_id', auth()->id())->firstOrFail();
+
+        // Resolve pending decision without purchasing
+        $engine->resolvePendingDecision($game, $player);
+        $this->offerPropertyId = null;
+        $this->dispatch('$refresh');
+        broadcast(new GameUpdated($this->inviteCode, 'skip_purchase'));
+    }
+
+    public function createTradeRequest(GameEngine $engine): void
     {
         $game = Game::query()
             ->with('board.properties', 'players')
@@ -116,7 +179,7 @@ class PlayGame extends Component
         }
 
         try {
-            $engine->executeTrade($game, $from, $to, (int) $this->tradeCashAmount, $property);
+            $engine->createTradeRequest($game, $from, $to, (int) $this->tradeCashAmount, $property);
         } catch (\Throwable $e) {
             // Optionally set a flash/message state in the future
         }
@@ -125,6 +188,42 @@ class PlayGame extends Component
         $this->tradeToPlayerId = null;
         $this->tradeCashAmount = 0;
         $this->tradePropertyId = null;
+
+        $this->dispatch('$refresh');
+    }
+
+    public function approveTrade(int $transactionId, GameEngine $engine): void
+    {
+        $game = Game::query()
+            ->with('players', 'turns.transactions.items')
+            ->where('invite_code', $this->inviteCode)
+            ->firstOrFail();
+
+        $approver = $game->players()->where('user_id', auth()->id())->firstOrFail();
+
+        try {
+            $engine->approveTrade($game, $transactionId, $approver);
+        } catch (\Throwable $e) {
+            // Optionally store an error message state
+        }
+
+        $this->dispatch('$refresh');
+    }
+
+    public function rejectTrade(int $transactionId, GameEngine $engine): void
+    {
+        $game = Game::query()
+            ->with('players', 'turns.transactions.items')
+            ->where('invite_code', $this->inviteCode)
+            ->firstOrFail();
+
+        $actor = $game->players()->where('user_id', auth()->id())->firstOrFail();
+
+        try {
+            $engine->rejectTrade($game, $transactionId, $actor);
+        } catch (\Throwable $e) {
+            // Optionally store an error message state
+        }
 
         $this->dispatch('$refresh');
     }
