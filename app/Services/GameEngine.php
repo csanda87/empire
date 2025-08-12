@@ -9,6 +9,7 @@ use App\Models\Card;
 use App\Models\Transaction;
 use App\Models\Turn;
 use Illuminate\Support\Facades\DB;
+use App\Models\PlayerAsset;
 
 class GameEngine
 {
@@ -18,6 +19,9 @@ class GameEngine
     public function rollAndAdvance(Game $game, Player $player): array
     {
         return DB::transaction(function () use ($game, $player) {
+            if (($game->status ?? '') === 'completed') {
+                throw new \RuntimeException('Game is completed');
+            }
             // Reuse an existing in-progress turn for doubles, otherwise create a new one
             /** @var Turn|null $turn */
             $turn = $game->turns()
@@ -167,10 +171,32 @@ class GameEngine
             $resolution = $this->resolveSpace($game, $turn, $player, $space);
             $transactions = array_merge($transactions, $resolution['transactions']);
 
-            // Determine if there is a blocking decision (e.g., offer to purchase)
-            $hasBlockingDecision = collect($resolution['actions'])->contains(function ($a) {
-                return ($a['type'] ?? null) === 'offer_purchase';
+            // Determine if there is a blocking decision (e.g., offer to purchase or payment required)
+            $actionsList = $resolution['actions'];
+            $hasBlockingDecision = collect($actionsList)->contains(function ($a) {
+                $t = ($a['type'] ?? null);
+                return $t === 'offer_purchase' || $t === 'payment_required';
             });
+
+            // Belt-and-suspenders: if player currently stands on an unowned property and
+            // no explicit offer was added (e.g., card text mapping edge cases), add an offer
+            // and treat it as blocking.
+            $currentSpace = $this->spaceAt($game, (int) $player->position);
+            if (!$hasBlockingDecision && $currentSpace instanceof Property && !$this->assetForGame($game, $currentSpace)) {
+                $alreadyOffered = collect($actionsList)->contains(function ($a) use ($currentSpace) {
+                    return ($a['type'] ?? null) === 'offer_purchase'
+                        && (int) ($a['property_id'] ?? 0) === (int) $currentSpace->id;
+                });
+                if (!$alreadyOffered) {
+                    $actionsList[] = [
+                        'type' => 'offer_purchase',
+                        'property_id' => $currentSpace->id,
+                        'price' => $currentSpace->price,
+                        'source' => 'card_or_roll',
+                    ];
+                }
+                $hasBlockingDecision = true;
+            }
             $sentToJoint = collect($resolution['actions'])->contains(function ($a) {
                 return ($a['type'] ?? null) === 'sent_to_joint';
             });
@@ -195,10 +221,28 @@ class GameEngine
                 'passed_go' => $passedGo,
                 'position' => $newPosition,
                 'space' => $this->spaceSummary($space),
-                'actions' => $resolution['actions'],
+                'actions' => $actionsList,
                 'transactions' => $transactions,
             ];
         });
+    }
+
+    /**
+     * Return the PlayerAsset for this property restricted to the given game's players.
+     */
+    protected function assetForGame(Game $game, Property $property): ?PlayerAsset
+    {
+        $playerIds = $game->players->pluck('id')->values();
+        if ($playerIds->isEmpty()) {
+            return null;
+        }
+        if ($property->relationLoaded('item')) {
+            $loaded = $property->getRelation('item');
+            if ($loaded && $playerIds->contains((int) $loaded->player_id)) {
+                return $loaded;
+            }
+        }
+        return $property->item()->whereIn('player_id', $playerIds)->first();
     }
 
     /**
@@ -272,6 +316,9 @@ class GameEngine
     public function payToLeaveJoint(Game $game, Player $player): array
     {
         return DB::transaction(function () use ($game, $player) {
+            if (($game->status ?? '') === 'completed') {
+                throw new \RuntimeException('Game is completed');
+            }
             if (!$player->in_joint) {
                 throw new \RuntimeException('Player is not in The Joint');
             }
@@ -313,7 +360,7 @@ class GameEngine
 
     protected function spaceAt(Game $game, int $position): array|Property
     {
-        $flatSpaces = collect($game->board->getSpaces())->flatten(1)->values();
+        $flatSpaces = collect($game->board->getSpaces($game))->flatten(1)->values();
         return $flatSpaces[$position];
     }
 
@@ -366,14 +413,16 @@ class GameEngine
         }
 
         if ($space instanceof Property) {
-            $owner = optional($space->item)->player; // Player or null
+            $owner = optional($this->assetForGame($game, $space))->player; // Player or null
 
             if ($owner && $owner->id !== $player->id) {
                 $rent = $this->calculateRent($game, $turn, $owner, $space);
-                $transactions[] = $this->transferBetweenPlayers($game, $turn, $player, $owner, $rent);
-                $player->decrement('cash', $rent);
-                $owner->increment('cash', $rent);
-                $actions[] = ['type' => 'rent_paid', 'to' => $owner->id, 'amount' => $rent];
+                $charge = $this->attemptCharge($game, $turn, $player, $owner, $rent, 'rent');
+                $transactions = array_merge($transactions, $charge['transactions']);
+                $actions = array_merge($actions, $charge['actions']);
+                if ($charge['paid']) {
+                    $actions[] = ['type' => 'rent_paid', 'to' => $owner->id, 'amount' => $rent];
+                }
             } elseif (!$owner) {
                 $actions[] = [
                     'type' => 'offer_purchase',
@@ -419,16 +468,21 @@ class GameEngine
         $normalized = $this->normalizeCardEffects($card->effect);
         // If effect missing or is a noop, try to infer from message
         if (count($normalized) === 1 && ($normalized[0]['verb'] ?? '') === 'Do') {
-            $normalized = $this->inferEffectsFromMessage($card);
+            $normalized = $this->inferEffectsFromMessage($game, $card);
         }
 
         foreach ($normalized as $effect) {
-            $verb = $effect['verb'];
-            $arg = $effect['arg'];
+            $verb = (string) ($effect['verb'] ?? 'Do');
+            $arg = $effect['arg'] ?? null;
 
             switch ($verb) {
                 case 'Collect': {
                     $amount = (int) $arg;
+                    if ($player->in_joint) {
+                        // Cannot collect while in The Joint
+                        $actions[] = ['type' => 'noop', 'detail' => 'collect_blocked_in_joint', 'amount' => $amount, 'source' => 'card'];
+                        break;
+                    }
                     $transactions[] = $this->collectFromBank($game, $turn, $player, $amount);
                     $player->increment('cash', $amount);
                     $actions[] = ['type' => 'collect', 'amount' => $amount, 'source' => 'card'];
@@ -436,9 +490,12 @@ class GameEngine
                 }
                 case 'Pay': {
                     $amount = (int) $arg;
-                    $transactions[] = $this->payToBank($game, $turn, $player, $amount);
-                    $player->decrement('cash', $amount);
-                    $actions[] = ['type' => 'pay', 'amount' => $amount, 'source' => 'card'];
+                    $charge = $this->attemptCharge($game, $turn, $player, null, $amount, 'bank');
+                    $transactions = array_merge($transactions, $charge['transactions']);
+                    $actions = array_merge($actions, $charge['actions']);
+                    if ($charge['paid']) {
+                        $actions[] = ['type' => 'pay', 'amount' => $amount, 'source' => 'card'];
+                    }
                     break;
                 }
                 case 'MoveTo': {
@@ -482,20 +539,30 @@ class GameEngine
                     $amount = (int) $arg;
                     foreach ($game->players as $other) {
                         if ($other->id === $player->id) { continue; }
-                        $transactions[] = $this->transferBetweenPlayers($game, $turn, $player, $other, $amount);
-                        $player->decrement('cash', $amount);
-                        $other->increment('cash', $amount);
+                        $charge = $this->attemptCharge($game, $turn, $player, $other, $amount, 'card_pay_each');
+                        $transactions = array_merge($transactions, $charge['transactions']);
+                        $actions = array_merge($actions, $charge['actions']);
+                        if (!$charge['paid'] && ($player->is_bankrupt ?? false)) {
+                            break;
+                        }
                     }
-                    $actions[] = ['type' => 'pay_each_player', 'amount' => $amount, 'source' => 'card'];
+                    if (($player->is_bankrupt ?? false) === false) {
+                        $actions[] = ['type' => 'pay_each_player', 'amount' => $amount, 'source' => 'card'];
+                    }
                     break;
                 }
                 case 'CollectFromEachPlayer': {
                     $amount = (int) $arg;
+                    if ($player->in_joint) {
+                        // Cannot collect while in The Joint
+                        $actions[] = ['type' => 'noop', 'detail' => 'collect_each_blocked_in_joint', 'amount' => $amount, 'source' => 'card'];
+                        break;
+                    }
                     foreach ($game->players as $other) {
                         if ($other->id === $player->id) { continue; }
-                        $transactions[] = $this->transferBetweenPlayers($game, $turn, $other, $player, $amount);
-                        $other->decrement('cash', $amount);
-                        $player->increment('cash', $amount);
+                        $charge = $this->attemptCharge($game, $turn, $other, $player, $amount, 'card_collect_from_each');
+                        $transactions = array_merge($transactions, $charge['transactions']);
+                        $actions = array_merge($actions, $charge['actions']);
                     }
                     $actions[] = ['type' => 'collect_from_each_player', 'amount' => $amount, 'source' => 'card'];
                     break;
@@ -564,7 +631,7 @@ class GameEngine
     /**
      * Best-effort inference of card effect(s) from message text when effect is not stored.
      */
-    protected function inferEffectsFromMessage(Card $card): array
+    protected function inferEffectsFromMessage(Game $game, Card $card): array
     {
         $msg = strtolower((string) $card->message);
         $effects = [];
@@ -597,6 +664,16 @@ class GameEngine
             return $effects;
         }
 
+        // Advance to a named property (e.g., "Advance to St. Charles Place")
+        if (preg_match('/advance\s+to\s+([^\.]+)(\.|$)/i', (string) $card->message, $m)) {
+            $rawTitle = trim($m[1] ?? '');
+            $pos = $game->board->positionOfPropertyTitle($game, $rawTitle);
+            if ($pos !== null) {
+                $effects[] = ['verb' => 'MoveTo', 'arg' => $pos];
+                return $effects;
+            }
+        }
+
         if ($amount !== null) {
             if (str_contains($msg, 'collect') || str_contains($msg, 'receive') || str_contains($msg, 'bank pays')) {
                 $effects[] = ['verb' => 'Collect', 'arg' => $amount];
@@ -619,6 +696,8 @@ class GameEngine
         // Unhandled complex cases (nearest railroad/utility, repairs per house) => noop
         return [['verb' => 'Do', 'arg' => 'nothing']];
     }
+
+    // Removed local finder; now delegated to Board::positionOfPropertyTitle
 
     /**
      * Move player to an absolute board position, optionally awarding GO bonus if passed.
@@ -665,13 +744,15 @@ class GameEngine
         $transactions = [];
         $actions = [];
         if ($space instanceof Property) {
-            $owner = optional($space->item)->player; // Player or null
+            $owner = optional($this->assetForGame($game, $space))->player; // Player or null
             if ($owner && $owner->id !== $player->id) {
                 $rent = $this->calculateRent($game, $turn, $owner, $space);
-                $transactions[] = $this->transferBetweenPlayers($game, $turn, $player, $owner, $rent);
-                $player->decrement('cash', $rent);
-                $owner->increment('cash', $rent);
-                $actions[] = ['type' => 'rent_paid', 'to' => $owner->id, 'amount' => $rent, 'source' => 'card'];
+                $charge = $this->attemptCharge($game, $turn, $player, $owner, $rent, 'rent');
+                $transactions = array_merge($transactions, $charge['transactions']);
+                $actions = array_merge($actions, $charge['actions']);
+                if ($charge['paid']) {
+                    $actions[] = ['type' => 'rent_paid', 'to' => $owner->id, 'amount' => $rent, 'source' => 'card'];
+                }
             } elseif (!$owner) {
                 $actions[] = [
                     'type' => 'offer_purchase',
@@ -759,10 +840,349 @@ class GameEngine
     }
 
     /**
+     * Attempt to charge a player an amount. If they have enough cash, pay immediately.
+     * If not enough cash but assets cover the amount, mark the turn as awaiting decision
+     * and return an action instructing the UI to let the player liquidate manually.
+     * If assets plus cash are insufficient, auto-liquidate: sell all units, mortgage
+     * all properties, transfer properties to the creditor if any, and pay as much as possible.
+     */
+    protected function attemptCharge(
+        Game $game,
+        Turn $turn,
+        Player $from,
+        ?Player $to,
+        int $amount,
+        string $reason
+    ): array {
+        $transactions = [];
+        $actions = [];
+        $amount = max(0, (int) $amount);
+        if ($amount === 0) {
+            return ['paid' => true, 'transactions' => [], 'actions' => []];
+        }
+
+        // If enough cash, settle immediately
+        if ((int) $from->cash >= $amount) {
+            if ($to) {
+                $transactions[] = $this->transferBetweenPlayers($game, $turn, $from, $to, $amount);
+                $from->decrement('cash', $amount);
+                $to->increment('cash', $amount);
+            } else {
+                $transactions[] = $this->payToBank($game, $turn, $from, $amount);
+                $from->decrement('cash', $amount);
+            }
+            return ['paid' => true, 'transactions' => $transactions, 'actions' => $actions];
+        }
+
+        // Compute total liquidation value
+        $liquidationValue = $this->calculateLiquidationValue($game, $from);
+        $totalPossible = (int) $from->cash + $liquidationValue;
+
+        if ($totalPossible >= $amount) {
+            // Require manual liquidation: block turn and prompt UI. Ensure we attach a hint about who is owed.
+            $turn->update(['status' => 'awaiting_decision']);
+            $actions[] = [
+                'type' => 'payment_required',
+                'amount' => $amount,
+                'to_player_id' => $to?->id,
+                'reason' => $reason,
+            ];
+            // Persist pending payment on the turn for refresh safety
+            $turn->update([
+                'pending_payment_amount' => $amount,
+                'pending_payment_to_player_id' => $to?->id,
+                'pending_payment_reason' => $reason,
+            ]);
+            return ['paid' => false, 'transactions' => $transactions, 'actions' => $actions];
+        }
+
+        // Not enough even after liquidation: present bankruptcy option (do not auto-bankrupt)
+        $turn->update(['status' => 'awaiting_decision']);
+        $turn->update([
+            'pending_payment_amount' => $amount,
+            'pending_payment_to_player_id' => $to?->id,
+            'pending_payment_reason' => $reason,
+        ]);
+        $actions[] = [
+            'type' => 'bankruptcy_available',
+            'amount' => $amount,
+            'to_player_id' => $to?->id,
+            'reason' => $reason,
+        ];
+
+        return ['paid' => false, 'transactions' => $transactions, 'actions' => $actions];
+    }
+
+    protected function calculateLiquidationValue(Game $game, Player $player): int
+    {
+        $value = 0;
+        $properties = $game->board->properties
+            ->filter(fn(Property $p) => ($this->assetForGame($game, $p)?->player_id ?? 0) === (int) $player->id);
+        foreach ($properties as $prop) {
+            $units = (int) ($this->assetForGame($game, $prop)?->units ?? 0);
+            $unitPrice = (int) ($prop->unit_price ?? 0);
+            if ($units > 0 && $unitPrice > 0) {
+                $value += (int) floor($units * ($unitPrice / 2));
+            }
+            $isMortgaged = (bool) (($this->assetForGame($game, $prop)?->is_mortgaged) ?? false);
+            if (!$isMortgaged) {
+                $value += (int) ($prop->mortgage_price ?? 0);
+            }
+        }
+        return $value;
+    }
+
+    /**
+     * Auto-sell all units, mortgage properties, and transfer properties to creditor if provided.
+     * Returns [transactions[], actions[]].
+     */
+    protected function autoLiquidateAndTransfer(Game $game, Turn $turn, Player $from, ?Player $to): array
+    {
+        $transactions = [];
+        $actions = [];
+        $properties = $game->board->properties
+            ->filter(fn(Property $p) => ($this->assetForGame($game, $p)?->player_id ?? 0) === (int) $from->id);
+        foreach ($properties as $prop) {
+            $asset = $this->assetForGame($game, $prop);
+            $units = (int) ($asset->units ?? 0);
+            $unitPrice = (int) ($prop->unit_price ?? 0);
+            if ($units > 0 && $unitPrice > 0) {
+                $refund = (int) floor($units * ($unitPrice / 2));
+                if ($refund > 0) {
+                    $tx = $game->transactions()->create(['turn_id' => $turn->id, 'status' => 'completed']);
+                    $tx->items()->create([
+                        'game_id' => $game->id,
+                        'type' => 'cash',
+                        'item_id' => 0,
+                        'amount' => $refund,
+                        'from_player_id' => null,
+                        'to_player_id' => $from->id,
+                    ]);
+                    $from->increment('cash', $refund);
+                    $asset->update(['units' => 0]);
+                    $transactions[] = $tx;
+                    $actions[] = ['type' => 'units_sold_auto', 'property_id' => $prop->id, 'amount' => $refund];
+                }
+            }
+
+            $isMortgaged = (bool) ($asset->is_mortgaged ?? false);
+            if (!$isMortgaged) {
+                $mortgageCash = (int) ($prop->mortgage_price ?? 0);
+                if ($mortgageCash > 0) {
+                    $tx = $game->transactions()->create(['turn_id' => $turn->id, 'status' => 'completed']);
+                    $tx->items()->create([
+                        'game_id' => $game->id,
+                        'type' => 'cash',
+                        'item_id' => 0,
+                        'amount' => $mortgageCash,
+                        'from_player_id' => null,
+                        'to_player_id' => $from->id,
+                    ]);
+                    $from->increment('cash', $mortgageCash);
+                    $asset->update(['is_mortgaged' => true]);
+                    $transactions[] = $tx;
+                    $actions[] = ['type' => 'mortgaged_auto', 'property_id' => $prop->id, 'amount' => $mortgageCash];
+                } else {
+                    $asset->update(['is_mortgaged' => true]);
+                    $actions[] = ['type' => 'mortgaged_auto', 'property_id' => $prop->id, 'amount' => 0];
+                }
+            }
+
+            // Transfer to creditor if applicable
+            if ($to) {
+                $asset->update(['player_id' => $to->id]);
+                $actions[] = ['type' => 'property_transferred_auto', 'property_id' => $prop->id, 'to' => $to->id];
+            }
+        }
+
+        return [$transactions, $actions];
+    }
+
+    /**
+     * Settle a pending payment while a turn is awaiting decision.
+     * If a creditor is specified, pay them; otherwise pay bank. Requires enough cash now.
+     * Afterwards, resume the awaiting turn according to doubles rules or complete it.
+     */
+    public function settlePendingPayment(Game $game, Player $player, int $amount, ?int $toPlayerId = null): array
+    {
+        return DB::transaction(function () use ($game, $player, $amount, $toPlayerId) {
+            /** @var Turn|null $turn */
+            $turn = $game->turns()
+                ->where('player_id', $player->id)
+                ->where('status', 'awaiting_decision')
+                ->orderByDesc('id')
+                ->first();
+            if (!$turn) {
+                throw new \RuntimeException('No pending payment to settle');
+            }
+
+            $amount = max(0, (int) $amount);
+            if ((int) $player->cash < $amount) {
+                throw new \RuntimeException('Insufficient cash to pay now');
+            }
+
+            $to = $toPlayerId ? $game->players->firstWhere('id', (int) $toPlayerId) : null;
+            if ($to) {
+                $this->transferBetweenPlayers($game, $turn, $player, $to, $amount);
+                $player->decrement('cash', $amount);
+                $to->increment('cash', $amount);
+            } else {
+                $this->payToBank($game, $turn, $player, $amount);
+                $player->decrement('cash', $amount);
+            }
+
+            // Resume turn: if last roll was a double, allow another roll; else complete.
+            // Clear pending fields first
+            $turn->update([
+                'pending_payment_amount' => null,
+                'pending_payment_to_player_id' => null,
+                'pending_payment_reason' => null,
+            ]);
+            $lastRoll = $turn->rolls()->orderByDesc('id')->first();
+            $wasDouble = (bool) optional($lastRoll)->is_double;
+            $turn->update(['status' => $wasDouble ? 'in_progress' : 'completed']);
+
+            return [
+                'settled' => true,
+                'turn_id' => $turn->id,
+                'status' => $turn->status,
+            ];
+        });
+    }
+
+    /**
+     * Declare bankruptcy: auto-sell all units, mortgage properties, transfer mortgaged properties to creditor,
+     * pay whatever cash exists, mark player bankrupt, and complete the turn.
+     */
+    public function declareBankruptcy(Game $game, Player $player): array
+    {
+        return DB::transaction(function () use ($game, $player) {
+            /** @var Turn|null $turn */
+            $turn = $game->turns()
+                ->where('player_id', $player->id)
+                ->where('status', 'awaiting_decision')
+                ->orderByDesc('id')
+                ->first();
+            if (!$turn) {
+                throw new \RuntimeException('No bankruptcy to declare');
+            }
+
+            $to = null;
+            if ($turn->pending_payment_to_player_id) {
+                $to = $game->players->firstWhere('id', (int) $turn->pending_payment_to_player_id);
+            }
+
+            // Liquidate and transfer
+            [$txAuto] = $this->autoLiquidateAndTransfer($game, $turn, $player, $to);
+
+            // Zero any remaining cash and mark bankrupt
+            $player->update(['is_bankrupt' => 1, 'cash' => 0]);
+
+            // Clear pending fields and complete turn
+            $turn->update([
+                'pending_payment_amount' => null,
+                'pending_payment_to_player_id' => null,
+                'pending_payment_reason' => null,
+                'status' => 'completed',
+            ]);
+
+            // If only one player remains, mark game as completed
+            $winner = $game->refresh()->winner;
+            if ($winner) {
+                $game->update(['status' => 'completed']);
+            }
+
+            return [
+                'bankrupt' => true,
+                'turn_id' => $turn->id,
+                'winner_player_id' => $winner?->id,
+            ];
+        });
+    }
+
+    /**
+     * Voluntarily leave a game: liquidate assets and remove the player from turn order.
+     * If there is a pending creditor on the player's most recent (awaiting) turn, transfer
+     * properties to that creditor after mortgaging; otherwise assets return to the bank.
+     * Remaining cash is zeroed and the player is marked bankrupt to exclude from play.
+     */
+    public function leaveGame(Game $game, Player $player): array
+    {
+        return DB::transaction(function () use ($game, $player) {
+            /** @var Turn|null $turn */
+            $turn = $game->turns()
+                ->where('player_id', $player->id)
+                ->orderByDesc('id')
+                ->first();
+
+            if (!$turn) {
+                // Create a synthetic completed turn to attach liquidation transactions
+                $turn = $game->turns()->create([
+                    'player_id' => $player->id,
+                    'status' => 'completed',
+                ]);
+            }
+
+            // Determine creditor if leaving during a pending payment
+            $to = null;
+            if ($turn->pending_payment_to_player_id) {
+                $to = $game->players->firstWhere('id', (int) $turn->pending_payment_to_player_id);
+            }
+
+            // Liquidate assets, transferring properties to creditor if applicable
+            $this->autoLiquidateAndTransfer($game, $turn, $player, $to);
+
+            // If there is no creditor, return properties to bank (remove ownership)
+            if (!$to) {
+                $properties = $game->board->properties
+                    ->filter(fn(Property $p) => ($this->assetForGame($game, $p)?->player_id ?? 0) === (int) $player->id);
+                foreach ($properties as $prop) {
+                    $asset = $this->assetForGame($game, $prop);
+                    if ($asset) { $asset->delete(); }
+                }
+            }
+
+            // Mark player as out and clear pending fields
+            $player->update([
+                'is_bankrupt' => 1,
+                'cash' => 0,
+                'in_joint' => false,
+                'joint_attempts' => 0,
+            ]);
+
+            $turn->update([
+                'pending_payment_amount' => null,
+                'pending_payment_to_player_id' => null,
+                'pending_payment_reason' => null,
+                'status' => 'completed',
+            ]);
+
+            // If only one player remains, mark game as completed
+            $winner = $game->refresh()->winner;
+            if ($winner) {
+                $game->update(['status' => 'completed']);
+            }
+
+            return [
+                'left' => true,
+                'turn_id' => $turn->id,
+                'winner_player_id' => $winner?->id,
+            ];
+        });
+    }
+    /**
      * Calculate rent for a property, including railroad logic.
      */
      protected function calculateRent(Game $game, Turn $turn, Player $owner, Property $property): int
     {
+        // Owner in The Joint cannot collect rent
+        if ((bool) ($owner->in_joint ?? false)) {
+            return 0;
+        }
+        // Mortgaged properties do not collect rent
+        if ($this->assetForGame($game, $property) && (bool) ($this->assetForGame($game, $property)->is_mortgaged ?? false)) {
+            return 0;
+        }
         // Utilities: rent is 4x dice total if 1 owned, 10x if both owned
         if (method_exists($property, 'isUtility') && $property->isUtility()) {
             $lastRoll = $turn->rolls()->orderByDesc('id')->first();
@@ -774,7 +1194,7 @@ class GameEngine
 
             $ownedUtilitiesCount = $game->board->properties
                 ->filter(fn (Property $p) => method_exists($p, 'isUtility') && $p->isUtility())
-                ->filter(fn (Property $p) => $p->item && (int) $p->item->player_id === (int) $owner->id)
+                ->filter(fn (Property $p) => ($this->assetForGame($game, $p)?->player_id ?? 0) === (int) $owner->id)
                 ->count();
 
             $multiplier = $ownedUtilitiesCount >= 2 ? 10 : 4;
@@ -785,7 +1205,7 @@ class GameEngine
         if (method_exists($property, 'isRailroad') && $property->isRailroad()) {
             $ownedRailroadsCount = $game->board->properties
                 ->filter(fn (Property $p) => method_exists($p, 'isRailroad') && $p->isRailroad())
-                ->filter(fn (Property $p) => $p->item && (int) $p->item->player_id === (int) $owner->id)
+                ->filter(fn (Property $p) => ($this->assetForGame($game, $p)?->player_id ?? 0) === (int) $owner->id)
                 ->count();
 
             $base = (int) ($property->rent ?? 25);
@@ -794,7 +1214,7 @@ class GameEngine
         }
 
         // Normal properties: use units and monopoly rules
-        $units = (int) optional($property->item)->units;
+        $units = (int) ($this->assetForGame($game, $property)?->units ?? 0);
         if ($units >= 5) {
             return (int) ($property->rent_five_unit ?? 0);
         }
@@ -823,19 +1243,33 @@ class GameEngine
     public function purchaseProperty(Game $game, Player $player, Property $property): array
     {
         return DB::transaction(function () use ($game, $player, $property) {
-            // Validate ownership and affordability
-            if ($property->item) {
+            if (($game->status ?? '') === 'completed') {
+                throw new \RuntimeException('Game is completed');
+            }
+            // Validate ownership (scoped to this game's players) and affordability
+            $playerIds = $game->players->pluck('id')->values();
+            $alreadyOwnedInThisGame = $property->relationLoaded('item')
+                ? (bool) $property->item
+                : $property->item()->whereIn('player_id', $playerIds)->exists();
+            if ($alreadyOwnedInThisGame) {
                 throw new \RuntimeException('Property already owned');
             }
             if ($player->cash < (int) $property->price) {
                 throw new \RuntimeException('Insufficient funds');
             }
 
-            // Create a synthetic turn if none active? For now, attach to latest or create a new quick turn
-            $turn = $game->turns()->create([
-                'player_id' => $player->id,
-                'status' => 'completed',
-            ]);
+            // Attach to an existing awaiting_decision turn if present; else create a concise completed turn
+            /** @var Turn|null $turn */
+            $turn = $game->turns()
+                ->where('player_id', $player->id)
+                ->orderByDesc('id')
+                ->first();
+            if (!$turn || ($turn->status ?? '') === 'completed') {
+                $turn = $game->turns()->create([
+                    'player_id' => $player->id,
+                    'status' => 'completed',
+                ]);
+            }
 
             // Pay bank
             $tx = $game->transactions()->create([
@@ -849,7 +1283,7 @@ class GameEngine
                 'item_id' => 0,
                 'amount' => (int) $property->price,
                 'from_player_id' => $player->id,
-                'to_player_id' => null,
+                'to_player_id' => null, // bank
             ]);
 
             // Transfer property from bank to player
@@ -885,12 +1319,16 @@ class GameEngine
     public function buyUnit(Game $game, Player $player, Property $property): array
     {
         return DB::transaction(function () use ($game, $player, $property) {
+            if (($game->status ?? '') === 'completed') {
+                throw new \RuntimeException('Game is completed');
+            }
             // Only current player may buy units
             if (!$game->current_player || (int) $game->current_player->id !== (int) $player->id) {
                 throw new \RuntimeException('You can only buy units on your turn');
             }
-            // Ownership checks
-            if (!$property->item || (int) $property->item->player_id !== (int) $player->id) {
+            // Ownership checks (scoped to this game)
+            $asset = $this->assetForGame($game, $property);
+            if (!$asset || (int) $asset->player_id !== (int) $player->id) {
                 throw new \RuntimeException('You do not own this property');
             }
             if (method_exists($property, 'isRailroad') && $property->isRailroad()) {
@@ -899,13 +1337,22 @@ class GameEngine
             if (method_exists($property, 'isUtility') && $property->isUtility()) {
                 throw new \RuntimeException('Cannot buy units on utilities');
             }
+            // Prevent units if rent tiers or unit pricing are not fully defined
+            if (method_exists($property, 'supportsUnits') && !$property->supportsUnits()) {
+                throw new \RuntimeException('Units are not available for this property');
+            }
             if (!method_exists($property, 'ownerOwnsFullColorSet') || !$property->ownerOwnsFullColorSet()) {
                 throw new \RuntimeException('Must own all properties of this color to buy units');
             }
 
-            $currentUnits = (int) ($property->item->units ?? 0);
+            $currentUnits = (int) ($asset->units ?? 0);
             if ($currentUnits >= 5) {
                 throw new \RuntimeException('Maximum units reached on this property');
+            }
+            // Ensure next unit has a corresponding rent tier
+            $nextUnits = $currentUnits + 1;
+            if (method_exists($property, 'hasRentForUnits') && !$property->hasRentForUnits($nextUnits)) {
+                throw new \RuntimeException('Units are not available for this property');
             }
 
             // Enforce even building: must build on a property with the fewest units in the color set
@@ -920,7 +1367,7 @@ class GameEngine
             if ($ownedColorSet->isEmpty()) {
                 throw new \RuntimeException('No buildable properties in this color set');
             }
-            $minUnits = (int) $ownedColorSet->map(fn(Property $p) => (int) optional($p->item)->units)->min();
+            $minUnits = (int) $ownedColorSet->map(fn(Property $p) => (int) ($this->assetForGame($game, $p)?->units ?? 0))->min();
             if ($currentUnits > $minUnits) {
                 throw new \RuntimeException('You must build evenly across the color set');
             }
@@ -951,7 +1398,7 @@ class GameEngine
             ]);
 
             $player->decrement('cash', $price);
-            $property->item->update(['units' => $currentUnits + 1]);
+            $asset->update(['units' => $currentUnits + 1]);
 
             return [
                 'transaction_id' => $tx->id,
@@ -967,14 +1414,18 @@ class GameEngine
     public function sellUnit(Game $game, Player $player, Property $property): array
     {
         return DB::transaction(function () use ($game, $player, $property) {
+            if (($game->status ?? '') === 'completed') {
+                throw new \RuntimeException('Game is completed');
+            }
             // Only current player may sell units
             if (!$game->current_player || (int) $game->current_player->id !== (int) $player->id) {
                 throw new \RuntimeException('You can only sell units on your turn');
             }
-            if (!$property->item || (int) $property->item->player_id !== (int) $player->id) {
+            $asset = $this->assetForGame($game, $property);
+            if (!$asset || (int) $asset->player_id !== (int) $player->id) {
                 throw new \RuntimeException('You do not own this property');
             }
-            if ((int) ($property->item->units ?? 0) <= 0) {
+            if ((int) ($asset->units ?? 0) <= 0) {
                 throw new \RuntimeException('No units to sell');
             }
 
@@ -989,8 +1440,8 @@ class GameEngine
             if ($ownedColorSet->isEmpty()) {
                 throw new \RuntimeException('No buildable properties in this color set');
             }
-            $maxUnits = (int) $ownedColorSet->map(fn(Property $p) => (int) optional($p->item)->units)->max();
-            if ((int) $property->item->units < $maxUnits) {
+            $maxUnits = (int) $ownedColorSet->map(fn(Property $p) => (int) ($this->assetForGame($game, $p)?->units ?? 0))->max();
+            if ((int) ($asset->units ?? 0) < $maxUnits) {
                 throw new \RuntimeException('You must sell evenly across the color set');
             }
 
@@ -1016,12 +1467,117 @@ class GameEngine
             ]);
 
             $player->increment('cash', $refund);
-            $property->item->decrement('units');
+            $asset->decrement('units');
 
             return [
                 'transaction_id' => $tx->id,
                 'property_id' => $property->id,
-                'units' => (int) $property->item->units,
+                'units' => (int) ($this->assetForGame($game, $property)?->units ?? 0),
+            ];
+        });
+    }
+
+    /**
+     * Mortgage a property: no units allowed, marks as mortgaged, grants mortgage cash.
+     */
+    public function mortgageProperty(Game $game, Player $player, Property $property): array
+    {
+        return DB::transaction(function () use ($game, $player, $property) {
+            if (!$game->current_player || (int) $game->current_player->id !== (int) $player->id) {
+                throw new \RuntimeException('You can only mortgage on your turn');
+            }
+            $asset = $this->assetForGame($game, $property);
+            if (!$asset || (int) $asset->player_id !== (int) $player->id) {
+                throw new \RuntimeException('You do not own this property');
+            }
+            if ((int) ($asset->units ?? 0) > 0) {
+                throw new \RuntimeException('Sell all units before mortgaging');
+            }
+            if ((bool) ($asset->is_mortgaged ?? false)) {
+                throw new \RuntimeException('Already mortgaged');
+            }
+
+            $amount = (int) ($property->mortgage_price ?? 0);
+            if ($amount < 0) { $amount = 0; }
+
+            $turn = $game->turns()->create([
+                'player_id' => $player->id,
+                'status' => 'completed',
+            ]);
+            $tx = $game->transactions()->create([
+                'turn_id' => $turn->id,
+                'status' => 'completed',
+            ]);
+            if ($amount > 0) {
+                $tx->items()->create([
+                    'game_id' => $game->id,
+                    'type' => 'cash',
+                    'item_id' => 0,
+                    'amount' => $amount,
+                    'from_player_id' => null,
+                    'to_player_id' => $player->id,
+                ]);
+                $player->increment('cash', $amount);
+            }
+
+            $asset->update(['is_mortgaged' => true]);
+
+            return [
+                'transaction_id' => $tx->id,
+                'property_id' => $property->id,
+                'mortgaged' => true,
+            ];
+        });
+    }
+
+    /**
+     * Unmortgage a property by paying unmortgage price.
+     */
+    public function unmortgageProperty(Game $game, Player $player, Property $property): array
+    {
+        return DB::transaction(function () use ($game, $player, $property) {
+            if (!$game->current_player || (int) $game->current_player->id !== (int) $player->id) {
+                throw new \RuntimeException('You can only unmortgage on your turn');
+            }
+            $asset = $this->assetForGame($game, $property);
+            if (!$asset || (int) $asset->player_id !== (int) $player->id) {
+                throw new \RuntimeException('You do not own this property');
+            }
+            if (!((bool) ($asset->is_mortgaged ?? false))) {
+                throw new \RuntimeException('Property is not mortgaged');
+            }
+
+            $amount = (int) ($property->unmortgage_price ?? 0);
+            if ((int) $player->cash < $amount) {
+                throw new \RuntimeException('Insufficient funds to unmortgage');
+            }
+
+            $turn = $game->turns()->create([
+                'player_id' => $player->id,
+                'status' => 'completed',
+            ]);
+            $tx = $game->transactions()->create([
+                'turn_id' => $turn->id,
+                'status' => 'completed',
+            ]);
+            if ($amount > 0) {
+                $tx->items()->create([
+                    'game_id' => $game->id,
+                    'type' => 'cash',
+                    'item_id' => 0,
+                    'amount' => $amount,
+                    'from_player_id' => $player->id,
+                    'to_player_id' => null,
+                ]);
+                $player->decrement('cash', $amount);
+            }
+
+            $asset->update(['is_mortgaged' => false]);
+
+            return [
+                'transaction_id' => $tx->id,
+                'property_id' => $property->id,
+                'mortgaged' => false,
             ];
         });
     }
@@ -1049,8 +1605,17 @@ class GameEngine
                 if (!$game->board->properties->contains('id', $property->id)) {
                     throw new \RuntimeException('Property not part of this game');
                 }
-                if (!$property->item || $property->item->player_id !== $from->id) {
+                $asset = $this->assetForGame($game, $property);
+                if (!$asset || $asset->player_id !== $from->id) {
                     throw new \RuntimeException('You do not own this property');
+                }
+                // Disallow trading any property if its color set has units by the current owner
+                $ownerOwnedProps = $game->board->properties
+                    ->filter(fn (Property $p) => ($this->assetForGame($game, $p)?->player_id ?? 0) === (int) $from->id)
+                    ->where('color', $property->color);
+                $unitsInColor = (int) $ownerOwnedProps->sum(fn(Property $p) => (int) ($this->assetForGame($game, $p)?->units ?? 0));
+                if ($unitsInColor > 0) {
+                    throw new \RuntimeException('Cannot trade a property in a color where you have units');
                 }
             }
 
@@ -1090,7 +1655,7 @@ class GameEngine
                 ]);
 
                 // Transfer ownership of the property
-                $property->item->update(['player_id' => $to->id]);
+                $asset->update(['player_id' => $to->id]);
             }
 
             return [
@@ -1126,8 +1691,16 @@ class GameEngine
                 if (!$game->board->properties->contains('id', $property->id)) {
                     throw new \RuntimeException('Property not part of this game');
                 }
-                if (!$property->item || $property->item->player_id !== $from->id) {
+                $asset = $this->assetForGame($game, $property);
+                if (!$asset || $asset->player_id !== $from->id) {
                     throw new \RuntimeException('You do not own this property');
+                }
+                $ownerOwnedProps = $game->board->properties
+                    ->filter(fn (Property $p) => ($this->assetForGame($game, $p)?->player_id ?? 0) === (int) $from->id)
+                    ->where('color', $property->color);
+                $unitsInColor = (int) $ownerOwnedProps->sum(fn(Property $p) => (int) ($this->assetForGame($game, $p)?->units ?? 0));
+                if ($unitsInColor > 0) {
+                    throw new \RuntimeException('Cannot trade a property in a color where you have units');
                 }
             }
 
@@ -1176,12 +1749,109 @@ class GameEngine
     }
 
     /**
+     * Create a pending trade with an arbitrary set of items (cash and/or properties) possibly in both directions.
+     * Each item must include: type ('cash'|'property'), item_id (0 for cash), amount (cash only), from_player_id, to_player_id.
+     */
+    public function createTradeRequestItems(
+        Game $game,
+        Player $from,
+        Player $to,
+        array $items
+    ): array {
+        return DB::transaction(function () use ($game, $from, $to, $items) {
+            if ($from->id === $to->id) {
+                throw new \RuntimeException('Cannot trade with yourself');
+            }
+
+            if (empty($items)) {
+                throw new \RuntimeException('Trade must include at least one item');
+            }
+
+            // Validate items
+            foreach ($items as $idx => $item) {
+                $type = (string) ($item['type'] ?? '');
+                $itemId = (int) ($item['item_id'] ?? 0);
+                $amount = (int) ($item['amount'] ?? 0);
+                $fromId = (int) ($item['from_player_id'] ?? 0);
+                $toId = (int) ($item['to_player_id'] ?? 0);
+
+                if (!in_array($type, ['cash', 'property'], true)) {
+                    throw new \RuntimeException("Invalid item type at index {$idx}");
+                }
+                if ($fromId === $toId) {
+                    throw new \RuntimeException('Item cannot be to the same player');
+                }
+                if (!$game->players->firstWhere('id', $fromId) || !$game->players->firstWhere('id', $toId)) {
+                    throw new \RuntimeException('Invalid players on trade');
+                }
+
+                if ($type === 'cash') {
+                    if ($amount < 0) {
+                        throw new \RuntimeException('Cash amount must be non-negative');
+                    }
+                } else { // property
+                    if ($itemId <= 0) {
+                        throw new \RuntimeException('Property id required');
+                    }
+                    /** @var Property $prop */
+                    $prop = Property::query()->findOrFail($itemId);
+                    if (!$game->board->properties->contains('id', $prop->id)) {
+                        throw new \RuntimeException('Property not part of this game');
+                    }
+                    $asset = $this->assetForGame($game, $prop);
+                    if (!$asset || (int) $asset->player_id !== $fromId) {
+                        throw new \RuntimeException('You do not own this property');
+                    }
+                    // Disallow if any units exist in the color group for the current owner
+                    $ownerOwnedProps = Property::query()
+                        ->where('board_id', $prop->board_id)
+                        ->whereRaw('LOWER(color) = ?', [strtolower((string) $prop->color)])
+                        ->whereHas('item', fn($q) => $q->where('player_id', $fromId))
+                        ->with('item')
+                        ->get();
+                    $unitsInColor = (int) $ownerOwnedProps->sum(fn(Property $p) => (int) ($this->assetForGame($game, $p)?->units ?? 0));
+                    if ($unitsInColor > 0) {
+                        throw new \RuntimeException('Cannot trade a property in a color where you have units');
+                    }
+                }
+            }
+
+            // Synthetic turn for traceability; ignored by current player logic
+            $turn = $game->turns()->create([
+                'player_id' => $from->id,
+                'status' => 'completed',
+            ]);
+
+            $tx = $game->transactions()->create([
+                'turn_id' => $turn->id,
+                'status' => 'pending',
+            ]);
+
+            foreach ($items as $item) {
+                $tx->items()->create([
+                    'game_id' => $game->id,
+                    'type' => (string) $item['type'],
+                    'item_id' => (int) $item['item_id'],
+                    'amount' => (int) ($item['amount'] ?? 0),
+                    'from_player_id' => (int) $item['from_player_id'],
+                    'to_player_id' => (int) $item['to_player_id'],
+                ]);
+            }
+
+            return [
+                'transaction_id' => $tx->id,
+                'status' => 'pending',
+            ];
+        });
+    }
+
+    /**
      * Approve a pending trade. Only the recipient can approve, and only on their turn.
      */
     public function approveTrade(Game $game, int $transactionId, Player $approver): array
     {
         return DB::transaction(function () use ($game, $transactionId, $approver) {
-            $tx = $game->transactions()->with('items')->where('id', $transactionId)->firstOrFail();
+            $tx = $game->transactions()->with(['items', 'turn'])->where('id', $transactionId)->firstOrFail();
             if ($tx->status !== 'pending') {
                 throw new \RuntimeException('Trade is not pending');
             }
@@ -1189,6 +1859,12 @@ class GameEngine
             // Must be approver's turn
             if (!$game->current_player || $game->current_player->id !== $approver->id) {
                 throw new \RuntimeException('Only the current player can approve a trade');
+            }
+
+            // Initiator (the player who created the trade/turn) cannot approve their own trade
+            $initiatorId = (int) optional($tx->turn)->player_id;
+            if ($initiatorId === (int) $approver->id) {
+                throw new \RuntimeException('You cannot approve a trade you initiated');
             }
 
             // Validate approver is the recipient on at least one item
@@ -1216,14 +1892,50 @@ class GameEngine
                 } elseif ($item->type === 'property') {
                     $property = Property::query()->findOrFail((int) $item->item_id);
                     // Ensure ownership has not changed
-                    if (!$property->item || (int) $property->item->player_id !== (int) $item->from_player_id) {
+                    $asset = $this->assetForGame($game, $property);
+                    if (!$asset || (int) $asset->player_id !== (int) $item->from_player_id) {
                         throw new \RuntimeException('Property no longer owned by the expected player');
                     }
-                    $property->item->update(['player_id' => (int) $item->to_player_id]);
+                    // Guard: sender must not have units on the color
+                    $ownerOwnedProps = Property::query()
+                        ->where('board_id', $property->board_id)
+                        ->whereRaw('LOWER(color) = ?', [strtolower((string) $property->color)])
+                        ->whereHas('item', fn($q) => $q->where('player_id', (int) $item->from_player_id))
+                        ->with('item')
+                        ->get();
+                    $unitsInColor = (int) $ownerOwnedProps->sum(fn(Property $p) => (int) ($this->assetForGame($game, $p)?->units ?? 0));
+                    if ($unitsInColor > 0) {
+                        throw new \RuntimeException('Cannot trade a property in a color where you have units');
+                    }
+                    $asset->update(['player_id' => (int) $item->to_player_id]);
                 }
             }
 
             $tx->update(['status' => 'completed']);
+
+            // After approval, reject any other pending trades that include properties from this transaction
+            $approvedPropertyIds = collect($tx->items)
+                ->where('type', 'property')
+                ->pluck('item_id')
+                ->map(fn($id) => (int) $id)
+                ->filter()
+                ->values();
+
+            if ($approvedPropertyIds->isNotEmpty()) {
+                $conflictingTxIds = Transaction::query()
+                    ->where('game_id', $game->id)
+                    ->where('status', 'pending')
+                    ->where('id', '!=', $tx->id)
+                    ->whereHas('items', function ($q) use ($approvedPropertyIds) {
+                        $q->where('type', 'property')
+                          ->whereIn('item_id', $approvedPropertyIds);
+                    })
+                    ->pluck('id');
+
+                if ($conflictingTxIds->isNotEmpty()) {
+                    Transaction::query()->whereIn('id', $conflictingTxIds)->update(['status' => 'rejected']);
+                }
+            }
 
             return [
                 'transaction_id' => $tx->id,

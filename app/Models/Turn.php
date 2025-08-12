@@ -10,6 +10,9 @@ class Turn extends Model
         'game_id',
         'player_id',
         'status',
+        'pending_payment_amount',
+        'pending_payment_to_player_id',
+        'pending_payment_reason',
     ];
 
     public function player()

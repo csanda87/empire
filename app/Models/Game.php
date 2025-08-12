@@ -56,6 +56,19 @@ class Game extends Model
     }
 
     /**
+     * Accessor: winner when only one non-bankrupt player remains; otherwise null.
+     */
+    protected function winner(): Attribute
+    {
+        return Attribute::make(
+            get: function (): ?Player {
+                $active = $this->active_players; // accessor above
+                return $active->count() === 1 ? $active->first() : null;
+            },
+        );
+    }
+
+    /**
      * Accessor: compute the player whose turn it is, based on the last turn that included a dice roll.
      * Synthetic turns (e.g., trades or purchases that create a completed turn without a roll)
      * are ignored for determining turn order.

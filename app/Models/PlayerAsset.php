@@ -11,6 +11,7 @@ class PlayerAsset extends Model
         'item_type',
         'item_id',
         'units',
+        'is_mortgaged',
     ];
 
     public function itemable()

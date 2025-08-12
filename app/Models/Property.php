@@ -82,4 +82,39 @@ class Property extends Model
         $color = strtolower((string) ($this->color ?? ''));
         return $type === 'utility' || $color === 'white';
     }
+
+    /**
+     * Determine if this property supports building units (houses/hotels).
+     * We require a defined unit price and all rent tiers to be present.
+     */
+    public function supportsUnits(): bool
+    {
+        if ($this->isRailroad() || $this->isUtility()) {
+            return false;
+        }
+
+        $hasUnitPrice = $this->unit_price !== null && (int) $this->unit_price > 0;
+        $hasAllTiers = $this->rent_one_unit !== null
+            && $this->rent_two_unit !== null
+            && $this->rent_three_unit !== null
+            && $this->rent_four_unit !== null
+            && $this->rent_five_unit !== null;
+
+        return $hasUnitPrice && $hasAllTiers;
+    }
+
+    /**
+     * Check that there is a rent tier defined for the specified number of units (1-5).
+     */
+    public function hasRentForUnits(int $units): bool
+    {
+        return match ($units) {
+            1 => $this->rent_one_unit !== null,
+            2 => $this->rent_two_unit !== null,
+            3 => $this->rent_three_unit !== null,
+            4 => $this->rent_four_unit !== null,
+            5 => $this->rent_five_unit !== null,
+            default => false,
+        };
+    }
 }

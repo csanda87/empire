@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
+use App\Models\Game;
 
 class Board extends Model
 {
@@ -22,12 +23,20 @@ class Board extends Model
         return $this->hasMany(Property::class);
     }
 
-    public function getSpaces()
+    public function getSpaces(Game $game)
     {
-        // Prefer already-loaded relation (with item) to avoid extra queries
-        $properties = $this->relationLoaded('properties')
-            ? $this->properties
-            : $this->properties()->with('item')->get();
+        // Always fetch properties with ownership scoped to this game's players
+        $playerIds = $game->players->pluck('id')->values();
+        $properties = $this->properties()
+            ->with(['item' => function ($q) use ($playerIds) {
+                if ($playerIds->isNotEmpty()) {
+                    $q->whereIn('player_id', $playerIds);
+                } else {
+                    // Ensure no cross-game leakage when no players yet
+                    $q->whereRaw('1 = 0');
+                }
+            }])
+            ->get();
 
         return [
             [
@@ -127,5 +136,29 @@ class Board extends Model
                 $properties->where('color', 'blue')->values()[1],
             ],
         ];
+    }
+
+    /**
+     * Find the absolute board index of a property by its title.
+     */
+    public function positionOfPropertyTitle(Game $game, string $title): ?int
+    {
+        $needle = strtolower(trim($title));
+        $normalize = function (string $s): string {
+            $s = strtolower(trim($s));
+            $s = str_replace(['.', '  '], ['', ' '], $s);
+            return $s;
+        };
+
+        $spaces = collect($this->getSpaces($game))->flatten(1)->values();
+        foreach ($spaces as $idx => $space) {
+            if ($space instanceof Property) {
+                $spaceTitle = (string) ($space->title ?? '');
+                if ($normalize($spaceTitle) === $normalize($needle)) {
+                    return (int) $idx;
+                }
+            }
+        }
+        return null;
     }
 }

@@ -6,38 +6,112 @@
             $lastRolledTurn = $game->turns->filter(fn($t) => $t->rolls->isNotEmpty())->first();
             $isAwaitingDecision = $isMyTurn && $lastRolledTurn && (int) $lastRolledTurn->player_id === (int) optional($me)->id && $lastRolledTurn->status === 'awaiting_decision';
             $canRoll = $isMyTurn && !$isAwaitingDecision;
+            $isWaiting = $game->status === 'waiting';
         @endphp
-        <button
-            wire:click="roll"
-            @class(['px-4','py-2','rounded','text-white','disabled:opacity-50',
-                'bg-blue-600 hover:bg-blue-700' => $canRoll,
-                'bg-gray-400 cursor-not-allowed' => !$canRoll,
-            ])
-            @disabled(!$canRoll)
-        >
-            Roll
-        </button>
-        <div class="text-sm text-gray-600 dark:text-gray-300">
-            @if ($game->current_player)
-                <span>Current turn: 
-                    <span class="font-semibold">
-                        <span class="bg-{{ $game->current_player->color }}-700 inline-block size-4 rounded-full align-middle"></span>
-                        {{ $game->current_player->name }}
+
+        @unless ($isWaiting)
+            <button
+                wire:click="roll"
+                @class(['px-4','py-2','rounded','text-white','disabled:opacity-50',
+                    'bg-blue-600 hover:bg-blue-700' => $canRoll && $game->status !== 'completed',
+                    'bg-gray-400 cursor-not-allowed' => !$canRoll || $game->status === 'completed',
+                ])
+                @disabled(!$canRoll || $game->status === 'completed')
+            >
+                Roll
+            </button>
+            <div class="text-sm text-gray-600 dark:text-gray-300">
+                @if ($game->current_player)
+                    <span>Current turn: 
+                        <span class="font-semibold">
+                            <span class="bg-{{ $game->current_player->color }}-700 inline-block size-4 rounded-full align-middle"></span>
+                            {{ $game->current_player->name }}
+                        </span>
                     </span>
-                </span>
+                @endif
+            </div>
+        @endunless
+
+        @php $me = $game->players->firstWhere('user_id', auth()->id()); $iAmBankrupt = (bool) optional($me)->is_bankrupt; @endphp
+        <div class="ml-auto flex items-center gap-2">
+            @php
+                $me = $game->players->firstWhere('user_id', auth()->id());
+                $canJoin = !$me && $game->status === 'waiting';
+                $isCreatorOrFirst = ($game->created_by === auth()->id()) || (optional($game->players->sortBy('id')->first())->user_id === auth()->id());
+                $canStart = $game->status === 'waiting' && $me && $isCreatorOrFirst && $game->players->count() >= 2;
+            @endphp
+            @if ($canJoin)
+                <button
+                    wire:click="joinGame"
+                    class="px-3 py-1 rounded text-white bg-emerald-600 hover:bg-emerald-700"
+                >Join Game</button>
+            @endif
+            @if ($canStart)
+                <button
+                    wire:click="startGame"
+                    class="px-3 py-1 rounded text-white bg-indigo-600 hover:bg-indigo-700"
+                >Start Game</button>
+            @endif
+            @if ($me)
+                <button
+                    x-data
+                    x-on:click="if (confirm('Are you sure you want to leave this game? Your assets will be liquidated and you will be removed from play.')) { $wire.leaveGame() }"
+                    @class(['px-3','py-1','rounded','text-white','disabled:opacity-50',
+                        'bg-red-600 hover:bg-red-700' => !$iAmBankrupt,
+                        'bg-gray-400 cursor-not-allowed' => $iAmBankrupt,
+                    ])
+                    @disabled($iAmBankrupt)
+                >Leave Game</button>
             @endif
         </div>
-        <div class="flex gap-2 text-lg">
-            @foreach($dice as $value)
-                <span class="inline-block w-12 h-12 leading-[3rem] text-center bg-gray-200 text-gray-800 rounded">{{ $value }}</span>
-            @endforeach
-        </div>
+
+        @unless ($isWaiting)
+            <div class="flex gap-2 text-lg">
+                @foreach($dice as $value)
+                    <span class="inline-block w-12 h-12 leading-[3rem] text-center bg-gray-200 text-gray-800 rounded">{{ $value }}</span>
+                @endforeach
+            </div>
+        @endunless
         {{-- No manual End Turn: turns auto-complete unless awaiting a decision --}}
     </div>
 
+    @unless ($game->status === 'waiting')
     @if($landingMessage)
         <div class="mb-4 p-3 rounded bg-indigo-50 text-indigo-900 border border-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-100 dark:border-indigo-800">
             {{ $landingMessage }}
+        </div>
+    @endif
+
+    @if ($error)
+        <div class="mb-4 p-3 rounded bg-amber-50 text-amber-900 border border-amber-200 dark:bg-amber-900/30 dark:text-amber-100 dark:border-amber-800">
+            {{ $error }}
+        </div>
+    @endif
+    @endunless
+
+    @php
+        $me = $game->players->firstWhere('user_id', auth()->id());
+        $isMyTurn = optional($game->current_player)->id === optional($me)->id;
+        $lastRolledTurn = $game->turns->filter(fn($t) => $t->rolls->isNotEmpty())->first();
+        $isAwaitingDecision = $isMyTurn && $lastRolledTurn && (int) $lastRolledTurn->player_id === (int) optional($me)->id && $lastRolledTurn->status === 'awaiting_decision';
+    @endphp
+
+    @if ($game->status !== 'waiting' && $isAwaitingDecision && $pendingPaymentAmount)
+        <div class="mb-4 p-3 rounded bg-amber-50 text-amber-900 border border-amber-200 dark:bg-amber-900/30 dark:text-amber-100 dark:border-amber-800">
+            <div class="flex items-center justify-between">
+                <div>You owe ${{ (int) $pendingPaymentAmount }}. Sell units or mortgage properties, then click Pay Now or declare bankruptcy.</div>
+                <div class="flex gap-2">
+                    <button
+                        wire:click="payNow"
+                        class="px-3 py-1 rounded bg-emerald-600 text-white disabled:opacity-50"
+                        @disabled(((int) optional($me)->cash) < (int) $pendingPaymentAmount)
+                    >Pay Now</button>
+                    <button
+                        wire:click="declareBankruptcy"
+                        class="px-3 py-1 rounded bg-rose-700 text-white"
+                    >Declare Bankruptcy</button>
+                </div>
+            </div>
         </div>
     @endif
 
@@ -49,7 +123,7 @@
         $canPayToLeave = $isMyTurn && $inJoint && $attempts < 2 && (int) ($me->cash ?? 0) >= 50;
     @endphp
 
-    @if ($inJoint)
+    @if ($game->status !== 'waiting' && $inJoint)
         <div class="mb-4 p-3 rounded bg-yellow-50 text-yellow-900 border border-yellow-200 dark:bg-yellow-900/30 dark:text-yellow-100 dark:border-yellow-800">
             You're in The Joint. Attempts so far: {{ $attempts }}.
             @if ($canPayToLeave)
@@ -58,7 +132,7 @@
         </div>
     @endif
 
-    @if($offerPropertyId)
+    @if($game->status !== 'waiting' && $offerPropertyId)
         @php
             $buyer = $game->players->firstWhere('user_id', auth()->id());
             $offerProperty = $game->board->properties->firstWhere('id', $offerPropertyId);
@@ -72,15 +146,15 @@
                     wire:click="buyProperty"
                     @class([
                         'px-3','py-1','rounded','text-white','disabled:opacity-50',
-                        'bg-green-600 hover:bg-green-700' => $canAffordPurchase,
-                        'bg-gray-400 cursor-not-allowed' => !$canAffordPurchase,
+                        'bg-green-600 hover:bg-green-700' => $canAffordPurchase && $game->status !== 'completed',
+                        'bg-gray-400 cursor-not-allowed' => !$canAffordPurchase || $game->status === 'completed',
                     ])
-                    @disabled(!$canAffordPurchase)
+                    @disabled(!$canAffordPurchase || $game->status === 'completed')
                     @if(!$canAffordPurchase) title="Insufficient funds" @endif
                 >
                     Buy
                 </button>
-                <button wire:click="skipPurchase" class="px-3 py-1 bg-gray-200 text-gray-800 rounded hover:bg-gray-300">Skip</button>
+                <button wire:click="skipPurchase" @class(['px-3','py-1','rounded', 'bg-gray-200 text-gray-800 hover:bg-gray-300' => $game->status !== 'completed', 'bg-gray-300 cursor-not-allowed' => $game->status === 'completed']) @disabled($game->status === 'completed')>Skip</button>
                 @if(!$canAffordPurchase)
                     <span class="text-sm text-yellow-800">You need ${{ $price }} but have ${{ (int) ($buyer->cash ?? 0) }}.</span>
                 @endif
@@ -88,12 +162,13 @@
         </div>
     @endif
 
+    @if ($game->status !== 'waiting')
     <div class="mb-6 p-4 bg-gray-50 dark:bg-gray-900/60 rounded border border-gray-200 dark:border-gray-700">
         <h3 class="font-semibold mb-2 text-gray-900 dark:text-gray-100">Trade</h3>
-        <div class="flex flex-col sm:flex-row gap-2 items-start sm:items-end">
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
             <div>
                 <label class="block text-sm text-gray-700 dark:text-gray-300">To Player</label>
-                <select wire:model="tradeToPlayerId" class="border rounded p-1 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 border-gray-300 dark:border-gray-600">
+                <select wire:model="tradeToPlayerId" class="w-full border rounded p-1 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 border-gray-300 dark:border-gray-600">
                     <option value="">Select player</option>
                     @foreach ($game->players as $p)
                         @if ($p->user_id !== auth()->id())
@@ -102,30 +177,90 @@
                     @endforeach
                 </select>
             </div>
+
             <div>
-                <label class="block text-sm text-gray-700 dark:text-gray-300">Cash</label>
-                <input type="number" min="0" step="1" wire:model="tradeCashAmount" class="border rounded p-1 w-28 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 border-gray-300 dark:border-gray-600" />
+                <label class="block text-sm font-semibold text-gray-900 dark:text-gray-100">You Give</label>
+                <div class="mt-1 space-y-2">
+                    <div>
+                        <label class="block text-xs text-gray-700 dark:text-gray-300">Cash</label>
+                        <input type="number" min="0" step="1" wire:model="tradeGiveCashAmount" class="w-full border rounded p-1 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 border-gray-300 dark:border-gray-600" />
+                    </div>
+                    <div>
+                        <label class="block text-xs text-gray-700 dark:text-gray-300">Properties</label>
+                        @php
+                            $me = $game->players->firstWhere('user_id', auth()->id());
+                            $ownedProps = $game->board->properties->filter(fn($prop) => optional($prop->item)->player_id === optional($me)->id);
+                            $colorsWithUnits = $ownedProps
+                                ->groupBy('color')
+                                ->filter(function($propsInColor){
+                                    return (int) $propsInColor->sum(fn($p) => (int) optional($p->item)->units) > 0;
+                                })
+                                ->keys()
+                                ->toArray();
+                            $myProps = $me?->assets
+                                ->where('itemable_type', 'App\\Models\\Property')
+                                ->pluck('itemable')
+                                ->filter()
+                                ->reject(fn($p) => in_array($p->color, $colorsWithUnits, true))
+                                ->sortBy('title');
+                        @endphp
+                        <select multiple size="5" wire:model="tradeGivePropertyIds" class="w-full border rounded p-1 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 border-gray-300 dark:border-gray-600">
+                            @if ($myProps)
+                                @foreach ($myProps as $prop)
+                                    <option value="{{ $prop->id }}">{{ $prop->title }}</option>
+                                @endforeach
+                            @endif
+                        </select>
+                    </div>
+                </div>
             </div>
+
             <div>
-                <label class="block text-sm text-gray-700 dark:text-gray-300">Property</label>
-                <select wire:model="tradePropertyId" class="border rounded p-1 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 border-gray-300 dark:border-gray-600">
-                    <option value="">None</option>
-                    @php
-                        $me = $game->players->firstWhere('user_id', auth()->id());
-                        $myPropertyAssetItems = $me?->assets->where('itemable_type', 'App\\Models\\Property')->pluck('itemable');
-                    @endphp
-                    @if ($myPropertyAssetItems)
-                        @foreach ($myPropertyAssetItems as $prop)
-                            <option value="{{ $prop->id }}">{{ $prop->title }}</option>
-                        @endforeach
-                    @endif
-                </select>
-            </div>
-            <div>
-                <button wire:click="createTradeRequest" class="px-3 py-1 bg-indigo-600 text-white rounded hover:bg-indigo-700 dark:bg-indigo-500 dark:hover:bg-indigo-600">Send Trade Request</button>
+                <label class="block text-sm font-semibold text-gray-900 dark:text-gray-100">You Request</label>
+                <div class="mt-1 space-y-2">
+                    <div>
+                        <label class="block text-xs text-gray-700 dark:text-gray-300">Cash</label>
+                        <input type="number" min="0" step="1" wire:model="tradeRequestCashAmount" class="w-full border rounded p-1 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 border-gray-300 dark:border-gray-600" />
+                    </div>
+                    <div>
+                        <label class="block text-xs text-gray-700 dark:text-gray-300">Properties</label>
+                        @php
+                            $othersProps = collect();
+                            if ($game->players && $me) {
+                                $othersProps = $game->players
+                                    ->reject(fn($p) => $p->id === $me->id)
+                                    ->flatMap(function($p) use ($game) {
+                                        // Exclude any property whose owner has units on that color
+                                        $ownerOwnedProps = $game->board->properties->filter(fn($prop) => optional($prop->item)->player_id === $p->id);
+                                        $colorsWithUnits = $ownerOwnedProps
+                                            ->groupBy('color')
+                                            ->filter(fn($propsInColor) => (int) $propsInColor->sum(fn($x) => (int) optional($x->item)->units) > 0)
+                                            ->keys()
+                                            ->toArray();
+                                        return $p->assets
+                                            ->where('itemable_type', 'App\\Models\\Property')
+                                            ->pluck('itemable')
+                                            ->filter()
+                                            ->reject(fn($prop) => in_array($prop->color, $colorsWithUnits, true));
+                                    })
+                                    ->filter()
+                                    ->sortBy('title');
+                            }
+                        @endphp
+                        <select multiple size="5" wire:model="tradeRequestPropertyIds" class="w-full border rounded p-1 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 border-gray-300 dark:border-gray-600">
+                            @foreach ($othersProps as $prop)
+                                <option value="{{ $prop->id }}">{{ $prop->title }}</option>
+                            @endforeach
+                        </select>
+                    </div>
+                </div>
             </div>
         </div>
+        <div class="mt-3">
+            <button wire:click="createTradeRequest" class="px-3 py-1 bg-indigo-600 text-white rounded hover:bg-indigo-700 dark:bg-indigo-500 dark:hover:bg-indigo-600">Send Trade Request</button>
+        </div>
     </div>
+    @endif
 
     @php
         $me = $game->players->firstWhere('user_id', auth()->id());
@@ -140,17 +275,18 @@
             ->values();
     @endphp
 
-    @if($pendingTradesForMe->count())
+    @if($game->status !== 'waiting' && $pendingTradesForMe->count())
         <div class="mb-6 p-4 bg-blue-50 text-blue-900 rounded border border-blue-200 dark:bg-blue-900/30 dark:text-blue-100 dark:border-blue-800">
             <h3 class="font-semibold mb-2">Pending Trades</h3>
             <ul class="space-y-3">
                 @foreach ($pendingTradesForMe as $tx)
                     @php
                         $items = $tx->items;
-                        $fromId = optional($items->first())->from_player_id;
+                        $fromId = optional($tx->turn)->player_id;
                         $fromPlayer = $game->players->firstWhere('id', $fromId);
                         $isRecipient = $items->contains(fn($i) => (int) ($i->to_player_id ?? 0) === (int) optional($me)->id);
                         $isMyTurn = optional($game->current_player)->id === optional($me)->id;
+                        $isInitiator = (int) optional($tx->turn)->player_id === (int) optional($me)->id;
                     @endphp
                     <li class="p-3 rounded bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700">
                         <div class="flex items-center justify-between">
@@ -161,7 +297,10 @@
                                         @if ($i->type === 'cash' && $i->amount)
                                             Cash: ${{ $i->amount }} from {{ $game->players->firstWhere('id', $i->from_player_id)?->name }} to {{ $game->players->firstWhere('id', $i->to_player_id)?->name }}
                                         @elseif ($i->type === 'property')
-                                            Property: {{ $i->item?->title }} from {{ $game->players->firstWhere('id', $i->from_player_id)?->name }} to {{ $game->players->firstWhere('id', $i->to_player_id)?->name }}
+                                            @php
+                                                $propTitle = optional($i->item)->title ?? optional($game->board->properties->firstWhere('id', $i->item_id))->title;
+                                            @endphp
+                                            Property: {{ $propTitle ?? 'Property' }} from {{ $game->players->firstWhere('id', $i->from_player_id)?->name }} to {{ $game->players->firstWhere('id', $i->to_player_id)?->name }}
                                         @endif
                                         <br>
                                     @endforeach
@@ -171,11 +310,11 @@
                                 <button
                                     wire:click="approveTrade({{ $tx->id }})"
                                     @class(['px-3','py-1','rounded','text-white','disabled:opacity-50',
-                                        'bg-green-600 hover:bg-green-700' => $isRecipient && $isMyTurn,
-                                        'bg-gray-400 cursor-not-allowed' => !($isRecipient && $isMyTurn),
+                                        'bg-green-600 hover:bg-green-700' => $isRecipient && $isMyTurn && !$isInitiator,
+                                        'bg-gray-400 cursor-not-allowed' => !($isRecipient && $isMyTurn && !$isInitiator),
                                     ])
-                                    @disabled(!($isRecipient && $isMyTurn))
-                                    title="Only the recipient can approve on their turn"
+                                    @disabled(!($isRecipient && $isMyTurn && !$isInitiator))
+                                    title="Only the non-initiator recipient can approve on their turn"
                                 >Approve</button>
                                 <button
                                     wire:click="rejectTrade({{ $tx->id }})"
@@ -211,7 +350,7 @@
     <div class="mt-4">
         @php
             $gridSize = 11; // 11x11 grid => 40 outer cells (perimeter)
-            $spacesBySide = $game->board->getSpaces(); // 4 sides x 10 spaces each (corners included as first item per side)
+            $spacesBySide = $game->board->getSpaces($game); // 4 sides x 10 spaces each (corners included as first item per side)
             $boardGrid = [];
 
             for ($side = 0; $side < 4; $side++) {
@@ -287,7 +426,8 @@
                                         </div>
                                         @php
                                             // Resolve the Eloquent Property model for this board space
-                                            $propModel = $game->board->properties->firstWhere('id', $space['id'] ?? null);
+                                            // Use the space instance when it's a Property to avoid re-loading unscoped relations
+                                            $propModel = $space instanceof \App\Models\Property ? $space : $game->board->properties->firstWhere('id', $space['id'] ?? null);
                                             $units = (int) optional(optional($propModel)->item)->units;
                                         @endphp
                                         @if ($propModel && $units > 0)
@@ -310,6 +450,11 @@
     </div>
 
     <div class="mt-4">
+        @if ($game->status === 'completed' && $game->winner)
+            <div class="mb-4 p-3 rounded bg-emerald-50 text-emerald-900 border border-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-100 dark:border-emerald-800">
+                Winner: <strong>{{ $game->winner->name }}</strong>
+            </div>
+        @endif
         <div class="flex gap-4">
             <div class="w-full sm:w-1/2">
                 <h3>Players State</h3>
@@ -363,7 +508,7 @@
                                                     @endfor
                                                 </span>
                                             @endif
-                                            @if ($viewer && $viewer->id === optional($p->item)->player_id && $ownsFullSet)
+                                            @if ($game->status !== 'waiting' && $viewer && $viewer->id === optional($p->item)->player_id && $ownsFullSet && $p->supportsUnits())
                                                 <span class="ml-2 inline-flex items-center gap-1">
                                                     <button
                                                         class="px-1.5 py-0.5 text-xs rounded bg-emerald-600 text-white disabled:opacity-50"
@@ -372,20 +517,35 @@
                                                             !$isMyTurn || !$ownsFullSet ||
                                                             (int) optional($p->item)->units >= 5 ||
                                                             (int) $viewer->cash < (int) ($p->unit_price ?? 0) ||
-                                                            (int) optional($p->item)->units > (int) $minUnitsColor
+                                                             (int) optional($p->item)->units > (int) $minUnitsColor ||
+                                                             // Disable if property does not support units (missing rent tiers or unit price)
+                                                             (is_callable([$p, 'supportsUnits']) ? !$p->supportsUnits() : false)
                                                         )
-                                                        title="Buy unit for ${{ (int) ($p->unit_price ?? 0) }}"
+                                                          @if(!is_null($p->unit_price)) title="Buy unit for ${{ (int) $p->unit_price }}" @endif
                                                     >+ Unit</button>
-                                                    <button
+                                                     <button
                                                         class="px-1.5 py-0.5 text-xs rounded bg-rose-600 text-white disabled:opacity-50"
                                                         wire:click="sellUnit({{ $p->id }})"
                                                         @disabled(
-                                                            !$isMyTurn ||
+                                                            !$isMyTurn || $game->status === 'completed' ||
                                                             (int) optional($p->item)->units <= 0 ||
                                                             (int) optional($p->item)->units < (int) $maxUnitsColor
                                                         )
-                                                        title="Sell unit for ${{ (int) floor(((int) ($p->unit_price ?? 0)) / 2) }}"
+                                                          @if(!is_null($p->unit_price)) title="Sell unit for ${{ (int) floor(((int) $p->unit_price) / 2) }}" @endif
                                                     >- Unit</button>
+                                                    @php $isMortgaged = (bool) optional($p->item)->is_mortgaged; @endphp
+                                                    <button
+                                                        class="px-1.5 py-0.5 text-xs rounded bg-yellow-600 text-white disabled:opacity-50"
+                                                        wire:click="mortgageProperty({{ $p->id }})"
+                                                        @disabled(!$isMyTurn || $game->status === 'completed' || $isMortgaged || (int) optional($p->item)->units > 0)
+                                                        title="Mortgage for ${{ (int) ($p->mortgage_price ?? 0) }}"
+                                                    >Mortgage</button>
+                                                    <button
+                                                        class="px-1.5 py-0.5 text-xs rounded bg-blue-600 text-white disabled:opacity-50"
+                                                        wire:click="unmortgageProperty({{ $p->id }})"
+                                                        @disabled(!$isMyTurn || $game->status === 'completed' || !$isMortgaged || (int) optional($me)->cash < (int) ($p->unmortgage_price ?? 0))
+                                                        title="Unmortgage for ${{ (int) ($p->unmortgage_price ?? 0) }}"
+                                                    >Unmortgage</button>
                                                 </span>
                                             @endif
                                         </li>

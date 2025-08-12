@@ -20,8 +20,9 @@ return new class extends Migration
             $table->unsignedBigInteger('from_player_id')->nullable();
             $table->unsignedBigInteger('to_player_id')->nullable();
 
-            $table->foreign('from_player_id')->references('id')->on('games');
-            $table->foreign('to_player_id')->references('id')->on('games');
+            // Correct player FKs
+            $table->foreign('from_player_id')->references('id')->on('players');
+            $table->foreign('to_player_id')->references('id')->on('players');
         });
     }
 
