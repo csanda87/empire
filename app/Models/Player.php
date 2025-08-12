@@ -14,6 +14,8 @@ class Player extends Model
         'cash',
         'position',
         'is_bankrupt',
+        'in_joint',
+        'joint_attempts',
     ];
 
     public function assets()

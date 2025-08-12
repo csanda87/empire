@@ -24,7 +24,10 @@ class Board extends Model
 
     public function getSpaces()
     {
-        $properties = $this->properties()->get();
+        // Prefer already-loaded relation (with item) to avoid extra queries
+        $properties = $this->relationLoaded('properties')
+            ? $this->properties
+            : $this->properties()->with('item')->get();
 
         return [
             [

@@ -13,6 +13,10 @@ class Card extends Model
         'effect',
     ];
 
+    protected $casts = [
+        'effect' => 'array',
+    ];
+
     public function board()
     {
         return $this->belongsTo(Board::class);

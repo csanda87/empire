@@ -18,6 +18,8 @@ class PlayGame extends Component
     public ?int $tradeToPlayerId = null;
     public int $tradeCashAmount = 0;
     public ?int $tradePropertyId = null;
+    public ?string $error = null;
+    public ?int $unitsPropertyId = null;
 
     public function mount(string $inviteCode): void
     {
@@ -79,6 +81,16 @@ class PlayGame extends Component
     {
         if (!$space) {
             return null;
+        }
+
+        // If a card was drawn, surface its message prominently
+        foreach ($actions as $action) {
+            if (($action['type'] ?? null) === 'card_drawn') {
+                $deck = (string) ($action['deck'] ?? 'Card');
+                $msg = (string) ($action['message'] ?? '');
+                $title = is_array($space) ? ($space['title'] ?? 'a card space') : 'a card space';
+                return trim(sprintf('You landed on %s and drew a %s card: %s', $title, $deck, $msg));
+            }
         }
 
         // If rent was paid on landing, prefer a clear rent message
@@ -192,6 +204,24 @@ class PlayGame extends Component
         $this->dispatch('$refresh');
     }
 
+    public function payToLeaveJoint(GameEngine $engine): void
+    {
+        $game = Game::query()
+            ->with('players')
+            ->where('invite_code', $this->inviteCode)
+            ->firstOrFail();
+        $player = $game->players()->where('user_id', auth()->id())->firstOrFail();
+
+        try {
+            $engine->payToLeaveJoint($game, $player);
+            $this->error = null;
+        } catch (\Throwable $e) {
+            $this->error = $e->getMessage();
+        }
+
+        $this->dispatch('$refresh');
+    }
+
     public function approveTrade(int $transactionId, GameEngine $engine): void
     {
         $game = Game::query()
@@ -228,13 +258,59 @@ class PlayGame extends Component
         $this->dispatch('$refresh');
     }
 
+    public function buyUnit(int $propertyId, GameEngine $engine): void
+    {
+        $game = Game::query()
+            ->with('board.properties.item', 'players')
+            ->where('invite_code', $this->inviteCode)
+            ->firstOrFail();
+
+        $player = $game->players()->where('user_id', auth()->id())->firstOrFail();
+        $property = $game->board->properties->firstWhere('id', $propertyId);
+        if (!$property) {
+            return;
+        }
+
+        try {
+            $engine->buyUnit($game, $player, $property);
+            $this->error = null;
+        } catch (\Throwable $e) {
+            $this->error = $e->getMessage();
+        }
+
+        $this->dispatch('$refresh');
+    }
+
+    public function sellUnit(int $propertyId, GameEngine $engine): void
+    {
+        $game = Game::query()
+            ->with('board.properties.item', 'players')
+            ->where('invite_code', $this->inviteCode)
+            ->firstOrFail();
+
+        $player = $game->players()->where('user_id', auth()->id())->firstOrFail();
+        $property = $game->board->properties->firstWhere('id', $propertyId);
+        if (!$property) {
+            return;
+        }
+
+        try {
+            $engine->sellUnit($game, $player, $property);
+            $this->error = null;
+        } catch (\Throwable $e) {
+            $this->error = $e->getMessage();
+        }
+
+        $this->dispatch('$refresh');
+    }
+
     public function render(): ViewContract
     {
         $game = Game::query()
             ->has('board.properties')
             ->has('players')
             ->with(
-                'board.properties',
+                'board.properties.item',
                 'players.assets.itemable',
                 'turns.transactions.items.item',
                 'turns.transactions.items.fromPlayer:id,name,color',

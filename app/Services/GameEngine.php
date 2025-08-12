@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Models\Game;
 use App\Models\Player;
 use App\Models\Property;
+use App\Models\Card;
 use App\Models\Transaction;
 use App\Models\Turn;
 use Illuminate\Support\Facades\DB;
@@ -47,9 +48,88 @@ class GameEngine
             $transactions = [];
             $actions = [];
 
+            // Special handling: player is in The Joint
+            if ($player->in_joint) {
+                // Doubles => leave joint and move; otherwise increment attempts or on 3rd attempt, pay to leave and move
+                if ($isDouble) {
+                    // Leave joint
+                    $player->in_joint = false;
+                    $player->joint_attempts = 0;
+                    $player->save();
+                    $actions[] = ['type' => 'left_joint', 'via' => 'doubles'];
+
+                    // Move by rolled amount
+                    $this->movePlayerRelative($game, $turn, $player, $total);
+                    $space = $this->spaceAt($game, (int) $player->position);
+                    $resolution = $this->resolveSpace($game, $turn, $player, $space);
+                    $transactions = array_merge($transactions, $resolution['transactions']);
+
+                    // Always end turn after leaving joint, regardless of doubles
+                    $turn->update(['status' => 'completed']);
+                    return [
+                        'dice' => [$dieOne, $dieTwo],
+                        'total' => $total,
+                        'is_double' => false,
+                        'passed_go' => false,
+                        'position' => (int) $player->position,
+                        'space' => $this->spaceSummary($space),
+                        'actions' => array_merge($actions, $resolution['actions']),
+                        'transactions' => $transactions,
+                    ];
+                }
+
+                // Not doubles
+                if ((int) $player->joint_attempts < 2) {
+                    $player->increment('joint_attempts');
+                    $actions[] = ['type' => 'joint_failed_attempt', 'attempts' => (int) $player->joint_attempts];
+                    $turn->update(['status' => 'completed']);
+                    $space = $this->spaceAt($game, (int) $player->position);
+                    return [
+                        'dice' => [$dieOne, $dieTwo],
+                        'total' => $total,
+                        'is_double' => false,
+                        'passed_go' => false,
+                        'position' => (int) $player->position,
+                        'space' => $this->spaceSummary($space),
+                        'actions' => $actions,
+                        'transactions' => $transactions,
+                    ];
+                }
+
+                // Third failed attempt: pay up to $50, leave, move
+                $amountToPay = min(50, (int) $player->cash);
+                if ($amountToPay > 0) {
+                    $transactions[] = $this->payToBank($game, $turn, $player, $amountToPay);
+                    $player->decrement('cash', $amountToPay);
+                }
+                $player->in_joint = false;
+                $player->joint_attempts = 0;
+                $player->save();
+                $actions[] = ['type' => 'left_joint', 'via' => 'paid', 'amount' => $amountToPay];
+
+                $this->movePlayerRelative($game, $turn, $player, $total);
+                $space = $this->spaceAt($game, (int) $player->position);
+                $resolution = $this->resolveSpace($game, $turn, $player, $space);
+                $transactions = array_merge($transactions, $resolution['transactions']);
+
+                $turn->update(['status' => 'completed']);
+                return [
+                    'dice' => [$dieOne, $dieTwo],
+                    'total' => $total,
+                    'is_double' => false,
+                    'passed_go' => false,
+                    'position' => (int) $player->position,
+                    'space' => $this->spaceSummary($space),
+                    'actions' => array_merge($actions, $resolution['actions']),
+                    'transactions' => $transactions,
+                ];
+            }
+
             // Handle third consecutive double: go directly to The Joint (position 10), no movement and end turn
             if ($isDouble && $existingDoublesCount >= 2) {
                 $player->position = 10;
+                $player->in_joint = true;
+                $player->joint_attempts = 0;
                 $player->save();
 
                 $space = $this->spaceAt($game, 10);
@@ -91,6 +171,9 @@ class GameEngine
             $hasBlockingDecision = collect($resolution['actions'])->contains(function ($a) {
                 return ($a['type'] ?? null) === 'offer_purchase';
             });
+            $sentToJoint = collect($resolution['actions'])->contains(function ($a) {
+                return ($a['type'] ?? null) === 'sent_to_joint';
+            });
 
             // Set status rules:
             // - Third double already handled above and completed
@@ -99,6 +182,8 @@ class GameEngine
             // - Else, complete the turn immediately
             if ($hasBlockingDecision) {
                 $turn->update(['status' => 'awaiting_decision']);
+            } elseif ($sentToJoint) {
+                $turn->update(['status' => 'completed']);
             } else {
                 $turn->update(['status' => $isDouble ? 'in_progress' : 'completed']);
             }
@@ -180,6 +265,52 @@ class GameEngine
         });
     }
 
+    /**
+     * Manually pay $50 to leave The Joint before the third attempt.
+     * Does not move the player; they should roll normally afterward.
+     */
+    public function payToLeaveJoint(Game $game, Player $player): array
+    {
+        return DB::transaction(function () use ($game, $player) {
+            if (!$player->in_joint) {
+                throw new \RuntimeException('Player is not in The Joint');
+            }
+            if ((int) $player->cash < 50) {
+                throw new \RuntimeException('Insufficient funds to leave The Joint');
+            }
+
+            // Synthetic completed turn for traceability
+            $turn = $game->turns()->create([
+                'player_id' => $player->id,
+                'status' => 'completed',
+            ]);
+
+            $tx = $game->transactions()->create([
+                'turn_id' => $turn->id,
+                'status' => 'completed',
+            ]);
+
+            $tx->items()->create([
+                'game_id' => $game->id,
+                'type' => 'cash',
+                'item_id' => 0,
+                'amount' => 50,
+                'from_player_id' => $player->id,
+                'to_player_id' => null,
+            ]);
+
+            $player->decrement('cash', 50);
+            $player->in_joint = false;
+            $player->joint_attempts = 0;
+            $player->save();
+
+            return [
+                'transaction_id' => $tx->id,
+                'left_joint' => true,
+            ];
+        });
+    }
+
     protected function spaceAt(Game $game, int $position): array|Property
     {
         $flatSpaces = collect($game->board->getSpaces())->flatten(1)->values();
@@ -213,8 +344,10 @@ class GameEngine
                 case 'Move':
                     if ($arg === 'toJoint') {
                         $player->position = 10;
+                        $player->in_joint = true;
+                        $player->joint_attempts = 0;
                         $player->save();
-                        $actions[] = ['type' => 'move', 'to' => 10];
+                        $actions[] = ['type' => 'sent_to_joint'];
                     }
                     break;
 
@@ -223,7 +356,9 @@ class GameEngine
                     break;
 
                 case 'Draw':
-                    $actions[] = ['type' => 'draw', 'deck' => $arg];
+                    [$cardTx, $cardActions] = $this->drawAndResolveCard($game, $turn, $player, (string) $arg);
+                    $transactions = array_merge($transactions, $cardTx);
+                    $actions = array_merge($actions, $cardActions);
                     break;
             }
 
@@ -234,7 +369,7 @@ class GameEngine
             $owner = optional($space->item)->player; // Player or null
 
             if ($owner && $owner->id !== $player->id) {
-                $rent = (int) ($space->rent ?? 0);
+                $rent = $this->calculateRent($game, $turn, $owner, $space);
                 $transactions[] = $this->transferBetweenPlayers($game, $turn, $player, $owner, $rent);
                 $player->decrement('cash', $rent);
                 $owner->increment('cash', $rent);
@@ -251,6 +386,304 @@ class GameEngine
         }
 
         return compact('transactions', 'actions');
+    }
+
+    /**
+     * Draw a card from a given deck type (e.g., "Vault" or "Fate") and apply its effects.
+     * Returns [transactions[], actions[]].
+     */
+    protected function drawAndResolveCard(Game $game, Turn $turn, Player $player, string $deckType): array
+    {
+        $transactions = [];
+        $actions = [];
+
+        /** @var Card|null $card */
+        $card = Card::query()
+            ->where('board_id', $game->board->id)
+            ->whereRaw('LOWER(type) = ?', [strtolower($deckType)])
+            ->inRandomOrder()
+            ->first();
+
+        if (!$card) {
+            $actions[] = ['type' => 'card_drawn_none', 'deck' => $deckType];
+            return [$transactions, $actions];
+        }
+
+        $actions[] = [
+            'type' => 'card_drawn',
+            'deck' => $deckType,
+            'card_id' => $card->id,
+            'message' => $card->message,
+        ];
+
+        $normalized = $this->normalizeCardEffects($card->effect);
+        // If effect missing or is a noop, try to infer from message
+        if (count($normalized) === 1 && ($normalized[0]['verb'] ?? '') === 'Do') {
+            $normalized = $this->inferEffectsFromMessage($card);
+        }
+
+        foreach ($normalized as $effect) {
+            $verb = $effect['verb'];
+            $arg = $effect['arg'];
+
+            switch ($verb) {
+                case 'Collect': {
+                    $amount = (int) $arg;
+                    $transactions[] = $this->collectFromBank($game, $turn, $player, $amount);
+                    $player->increment('cash', $amount);
+                    $actions[] = ['type' => 'collect', 'amount' => $amount, 'source' => 'card'];
+                    break;
+                }
+                case 'Pay': {
+                    $amount = (int) $arg;
+                    $transactions[] = $this->payToBank($game, $turn, $player, $amount);
+                    $player->decrement('cash', $amount);
+                    $actions[] = ['type' => 'pay', 'amount' => $amount, 'source' => 'card'];
+                    break;
+                }
+                case 'MoveTo': {
+                    $to = (int) $arg;
+                    $passedGo = $this->movePlayerTo($game, $turn, $player, $to, true);
+                    $actions[] = ['type' => 'move', 'to' => $to, 'source' => 'card', 'passed_go' => $passedGo];
+                    [$tx2, $act2] = $this->resolvePropertyLanding($game, $turn, $player);
+                    $transactions = array_merge($transactions, $tx2);
+                    $actions = array_merge($actions, $act2);
+                    break;
+                }
+                case 'MoveRelative': {
+                    $delta = (int) $arg;
+                    $passedGo = $this->movePlayerRelative($game, $turn, $player, $delta);
+                    $actions[] = ['type' => 'move', 'by' => $delta, 'source' => 'card', 'passed_go' => $passedGo];
+                    [$tx2, $act2] = $this->resolvePropertyLanding($game, $turn, $player);
+                    $transactions = array_merge($transactions, $tx2);
+                    $actions = array_merge($actions, $act2);
+                    break;
+                }
+                case 'GoToJoint': {
+                    // Directly to The Joint (jail) without GO bonus
+                    $player->position = 10;
+                    $player->in_joint = true;
+                    $player->joint_attempts = 0;
+                    $player->save();
+                    $actions[] = ['type' => 'sent_to_joint', 'source' => 'card'];
+                    break;
+                }
+                case 'Keep': {
+                    // Keepable card (e.g., Get Out of Joint). Attach the card to the player as an asset.
+                    if (!$card->item) {
+                        $card->item()->create(['player_id' => $player->id]);
+                    } else {
+                        $card->item->update(['player_id' => $player->id]);
+                    }
+                    $actions[] = ['type' => 'card_kept', 'card_id' => $card->id];
+                    break;
+                }
+                case 'PayEachPlayer': {
+                    $amount = (int) $arg;
+                    foreach ($game->players as $other) {
+                        if ($other->id === $player->id) { continue; }
+                        $transactions[] = $this->transferBetweenPlayers($game, $turn, $player, $other, $amount);
+                        $player->decrement('cash', $amount);
+                        $other->increment('cash', $amount);
+                    }
+                    $actions[] = ['type' => 'pay_each_player', 'amount' => $amount, 'source' => 'card'];
+                    break;
+                }
+                case 'CollectFromEachPlayer': {
+                    $amount = (int) $arg;
+                    foreach ($game->players as $other) {
+                        if ($other->id === $player->id) { continue; }
+                        $transactions[] = $this->transferBetweenPlayers($game, $turn, $other, $player, $amount);
+                        $other->decrement('cash', $amount);
+                        $player->increment('cash', $amount);
+                    }
+                    $actions[] = ['type' => 'collect_from_each_player', 'amount' => $amount, 'source' => 'card'];
+                    break;
+                }
+                default:
+                    $actions[] = ['type' => 'noop', 'detail' => $verb];
+            }
+        }
+
+        return [$transactions, $actions];
+    }
+
+    /**
+     * Normalize card effects into a list of ['verb' => string, 'arg' => mixed].
+     * Accepts string like "Collect::200"; associative arrays like ['Collect' => 200];
+     * objects like ['verb' => 'Collect', 'arg' => 200]; or arrays of such entries.
+     */
+    protected function normalizeCardEffects($rawEffect): array
+    {
+        if ($rawEffect === null || $rawEffect === '') {
+            return [['verb' => 'Do', 'arg' => 'nothing']];
+        }
+
+        // If effect is already a list, normalize each item
+        if (is_array($rawEffect) && array_is_list($rawEffect)) {
+            $out = [];
+            foreach ($rawEffect as $e) {
+                $n = $this->normalizeCardEffects($e);
+                foreach ($n as $item) { $out[] = $item; }
+            }
+            return $out;
+        }
+
+        // Single associative array or scalar/string
+        if (is_array($rawEffect)) {
+            // ['verb' => 'Collect', 'arg' => 200]
+            if (isset($rawEffect['verb'])) {
+                return [[
+                    'verb' => (string) $rawEffect['verb'],
+                    'arg' => $rawEffect['arg'] ?? null,
+                ]];
+            }
+            // ['Collect' => 200]
+            if (count($rawEffect) === 1) {
+                $verb = (string) array_key_first($rawEffect);
+                $arg = $rawEffect[$verb];
+                return [[
+                    'verb' => $verb,
+                    'arg' => $arg,
+                ]];
+            }
+        }
+
+        // Strings like "Collect::200"
+        if (is_string($rawEffect)) {
+            [$verb, $arg] = array_pad(explode('::', $rawEffect, 2), 2, null);
+            return [[
+                'verb' => (string) $verb,
+                'arg' => $arg,
+            ]];
+        }
+
+        return [['verb' => 'Do', 'arg' => 'nothing']];
+    }
+
+    /**
+     * Best-effort inference of card effect(s) from message text when effect is not stored.
+     */
+    protected function inferEffectsFromMessage(Card $card): array
+    {
+        $msg = strtolower((string) $card->message);
+        $effects = [];
+
+        // Simple amount extraction
+        $amount = null;
+        if (preg_match('/\$(\s*)?(\d{1,5})/', $msg, $m)) {
+            $amount = (int) ($m[2] ?? 0);
+        }
+
+        if (str_contains($msg, 'get out of jail')) {
+            $effects[] = ['verb' => 'Keep'];
+            return $effects;
+        }
+        if (str_contains($msg, 'go back 3')) {
+            $effects[] = ['verb' => 'MoveRelative', 'arg' => -3];
+            return $effects;
+        }
+        if (str_contains($msg, 'go to jail')) {
+            $effects[] = ['verb' => 'GoToJoint'];
+            return $effects;
+        }
+        if (str_contains($msg, 'advance to go')) {
+            $effects[] = ['verb' => 'MoveTo', 'arg' => 0];
+            if ($amount && str_contains($msg, 'collect')) {
+                $effects[] = ['verb' => 'Collect', 'arg' => $amount];
+            } else {
+                $effects[] = ['verb' => 'Collect', 'arg' => self::GO_BONUS];
+            }
+            return $effects;
+        }
+
+        if ($amount !== null) {
+            if (str_contains($msg, 'collect') || str_contains($msg, 'receive') || str_contains($msg, 'bank pays')) {
+                $effects[] = ['verb' => 'Collect', 'arg' => $amount];
+                return $effects;
+            }
+            if (str_contains($msg, 'pay each player')) {
+                $effects[] = ['verb' => 'PayEachPlayer', 'arg' => $amount];
+                return $effects;
+            }
+            if (str_contains($msg, 'collect') && str_contains($msg, 'every player')) {
+                $effects[] = ['verb' => 'CollectFromEachPlayer', 'arg' => $amount];
+                return $effects;
+            }
+            if (str_contains($msg, 'pay')) {
+                $effects[] = ['verb' => 'Pay', 'arg' => $amount];
+                return $effects;
+            }
+        }
+
+        // Unhandled complex cases (nearest railroad/utility, repairs per house) => noop
+        return [['verb' => 'Do', 'arg' => 'nothing']];
+    }
+
+    /**
+     * Move player to an absolute board position, optionally awarding GO bonus if passed.
+     * Returns whether GO was passed and bonus awarded.
+     */
+    protected function movePlayerTo(Game $game, Turn $turn, Player $player, int $newPosition, bool $awardGoIfPassed = true): bool
+    {
+        $previous = (int) ($player->position ?? 0);
+        $passedGo = $awardGoIfPassed && $newPosition < $previous;
+        if ($passedGo) {
+            $this->collectFromBank($game, $turn, $player, self::GO_BONUS);
+            $player->increment('cash', self::GO_BONUS);
+        }
+        $player->position = $newPosition % self::BOARD_SIZE;
+        $player->save();
+        return $passedGo;
+    }
+
+    /**
+     * Move player by a relative delta; awards GO if crossing index 0.
+     */
+    protected function movePlayerRelative(Game $game, Turn $turn, Player $player, int $delta): bool
+    {
+        $previous = (int) ($player->position ?? 0);
+        $raw = $previous + $delta;
+        $wrapped = (($raw % self::BOARD_SIZE) + self::BOARD_SIZE) % self::BOARD_SIZE; // handle negatives
+        $passedGo = $delta > 0 && $raw >= self::BOARD_SIZE;
+        if ($passedGo) {
+            $this->collectFromBank($game, $turn, $player, self::GO_BONUS);
+            $player->increment('cash', self::GO_BONUS);
+        }
+        $player->position = $wrapped;
+        $player->save();
+        return $passedGo;
+    }
+
+    /**
+     * After a card-induced move, resolve only property landings (rent or purchase offer).
+     * Skips action spaces to prevent chained draws.
+     */
+    protected function resolvePropertyLanding(Game $game, Turn $turn, Player $player): array
+    {
+        $space = $this->spaceAt($game, (int) $player->position);
+        $transactions = [];
+        $actions = [];
+        if ($space instanceof Property) {
+            $owner = optional($space->item)->player; // Player or null
+            if ($owner && $owner->id !== $player->id) {
+                $rent = $this->calculateRent($game, $turn, $owner, $space);
+                $transactions[] = $this->transferBetweenPlayers($game, $turn, $player, $owner, $rent);
+                $player->decrement('cash', $rent);
+                $owner->increment('cash', $rent);
+                $actions[] = ['type' => 'rent_paid', 'to' => $owner->id, 'amount' => $rent, 'source' => 'card'];
+            } elseif (!$owner) {
+                $actions[] = [
+                    'type' => 'offer_purchase',
+                    'property_id' => $space->id,
+                    'price' => $space->price,
+                    'source' => 'card',
+                ];
+            } else {
+                $actions[] = ['type' => 'landed_own_property', 'property_id' => $space->id, 'source' => 'card'];
+            }
+        }
+        return [$transactions, $actions];
     }
 
     protected function collectFromBank(Game $game, Turn $turn, Player $to, int $amount): Transaction
@@ -325,6 +758,68 @@ class GameEngine
         return $space;
     }
 
+    /**
+     * Calculate rent for a property, including railroad logic.
+     */
+     protected function calculateRent(Game $game, Turn $turn, Player $owner, Property $property): int
+    {
+        // Utilities: rent is 4x dice total if 1 owned, 10x if both owned
+        if (method_exists($property, 'isUtility') && $property->isUtility()) {
+            $lastRoll = $turn->rolls()->orderByDesc('id')->first();
+            $diceTotal = (int) optional($lastRoll)->total;
+            if ($diceTotal <= 0) {
+                // Fallback to base rent if no roll found (e.g., card move)
+                return (int) ($property->rent ?? 0);
+            }
+
+            $ownedUtilitiesCount = $game->board->properties
+                ->filter(fn (Property $p) => method_exists($p, 'isUtility') && $p->isUtility())
+                ->filter(fn (Property $p) => $p->item && (int) $p->item->player_id === (int) $owner->id)
+                ->count();
+
+            $multiplier = $ownedUtilitiesCount >= 2 ? 10 : 4;
+            return $diceTotal * $multiplier;
+        }
+
+        // Railroads: rent doubles per additional railroad the owner holds on this board.
+        if (method_exists($property, 'isRailroad') && $property->isRailroad()) {
+            $ownedRailroadsCount = $game->board->properties
+                ->filter(fn (Property $p) => method_exists($p, 'isRailroad') && $p->isRailroad())
+                ->filter(fn (Property $p) => $p->item && (int) $p->item->player_id === (int) $owner->id)
+                ->count();
+
+            $base = (int) ($property->rent ?? 25);
+            $multiplier = max(1, $ownedRailroadsCount);
+            return (int) ($base * (2 ** ($multiplier - 1)));
+        }
+
+        // Normal properties: use units and monopoly rules
+        $units = (int) optional($property->item)->units;
+        if ($units >= 5) {
+            return (int) ($property->rent_five_unit ?? 0);
+        }
+        if ($units === 4) {
+            return (int) ($property->rent_four_unit ?? 0);
+        }
+        if ($units === 3) {
+            return (int) ($property->rent_three_unit ?? 0);
+        }
+        if ($units === 2) {
+            return (int) ($property->rent_two_unit ?? 0);
+        }
+        if ($units === 1) {
+            return (int) ($property->rent_one_unit ?? 0);
+        }
+
+        // No units: if owner owns full color set, apply color-set rent
+        if (method_exists($property, 'ownerOwnsFullColorSet') && $property->ownerOwnsFullColorSet()) {
+            return (int) ($property->rent_color_set ?? ($property->rent ?? 0));
+        }
+
+        // Default base rent
+        return (int) ($property->rent ?? 0);
+    }
+
     public function purchaseProperty(Game $game, Player $player, Property $property): array
     {
         return DB::transaction(function () use ($game, $player, $property) {
@@ -370,6 +865,7 @@ class GameEngine
             // Persist ownership
             $property->item()->create([
                 'player_id' => $player->id,
+                'units' => 0,
             ]);
 
             // Update balances
@@ -379,6 +875,153 @@ class GameEngine
                 'transaction_id' => $tx->id,
                 'property_id' => $property->id,
                 'player_id' => $player->id,
+            ];
+        });
+    }
+
+    /**
+     * Buy one unit (house/hotel) on a property. Requires full color set ownership and max 5 units.
+     */
+    public function buyUnit(Game $game, Player $player, Property $property): array
+    {
+        return DB::transaction(function () use ($game, $player, $property) {
+            // Only current player may buy units
+            if (!$game->current_player || (int) $game->current_player->id !== (int) $player->id) {
+                throw new \RuntimeException('You can only buy units on your turn');
+            }
+            // Ownership checks
+            if (!$property->item || (int) $property->item->player_id !== (int) $player->id) {
+                throw new \RuntimeException('You do not own this property');
+            }
+            if (method_exists($property, 'isRailroad') && $property->isRailroad()) {
+                throw new \RuntimeException('Cannot buy units on railroads');
+            }
+            if (method_exists($property, 'isUtility') && $property->isUtility()) {
+                throw new \RuntimeException('Cannot buy units on utilities');
+            }
+            if (!method_exists($property, 'ownerOwnsFullColorSet') || !$property->ownerOwnsFullColorSet()) {
+                throw new \RuntimeException('Must own all properties of this color to buy units');
+            }
+
+            $currentUnits = (int) ($property->item->units ?? 0);
+            if ($currentUnits >= 5) {
+                throw new \RuntimeException('Maximum units reached on this property');
+            }
+
+            // Enforce even building: must build on a property with the fewest units in the color set
+            $ownedColorSet = Property::query()
+                ->where('board_id', $property->board_id)
+                ->whereRaw('LOWER(color) = ?', [strtolower((string) $property->color)])
+                ->whereHas('item', fn($q) => $q->where('player_id', $player->id))
+                ->with('item')
+                ->get()
+                // Exclude non-buildables (railroads/utilities)
+                ->filter(fn(Property $p) => !(method_exists($p, 'isRailroad') && $p->isRailroad()) && !(method_exists($p, 'isUtility') && $p->isUtility()));
+            if ($ownedColorSet->isEmpty()) {
+                throw new \RuntimeException('No buildable properties in this color set');
+            }
+            $minUnits = (int) $ownedColorSet->map(fn(Property $p) => (int) optional($p->item)->units)->min();
+            if ($currentUnits > $minUnits) {
+                throw new \RuntimeException('You must build evenly across the color set');
+            }
+
+            $price = (int) ($property->unit_price ?? 0);
+            if ((int) $player->cash < $price) {
+                throw new \RuntimeException('Insufficient funds');
+            }
+
+            // Synthetic completed turn for audit
+            $turn = $game->turns()->create([
+                'player_id' => $player->id,
+                'status' => 'completed',
+            ]);
+
+            // Pay bank
+            $tx = $game->transactions()->create([
+                'turn_id' => $turn->id,
+                'status' => 'completed',
+            ]);
+            $tx->items()->create([
+                'game_id' => $game->id,
+                'type' => 'cash',
+                'item_id' => 0,
+                'amount' => $price,
+                'from_player_id' => $player->id,
+                'to_player_id' => null,
+            ]);
+
+            $player->decrement('cash', $price);
+            $property->item->update(['units' => $currentUnits + 1]);
+
+            return [
+                'transaction_id' => $tx->id,
+                'property_id' => $property->id,
+                'units' => $currentUnits + 1,
+            ];
+        });
+    }
+
+    /**
+     * Sell one unit from a property back to the bank at half price.
+     */
+    public function sellUnit(Game $game, Player $player, Property $property): array
+    {
+        return DB::transaction(function () use ($game, $player, $property) {
+            // Only current player may sell units
+            if (!$game->current_player || (int) $game->current_player->id !== (int) $player->id) {
+                throw new \RuntimeException('You can only sell units on your turn');
+            }
+            if (!$property->item || (int) $property->item->player_id !== (int) $player->id) {
+                throw new \RuntimeException('You do not own this property');
+            }
+            if ((int) ($property->item->units ?? 0) <= 0) {
+                throw new \RuntimeException('No units to sell');
+            }
+
+            // Enforce even selling: must sell from a property with the most units in the color set
+            $ownedColorSet = Property::query()
+                ->where('board_id', $property->board_id)
+                ->whereRaw('LOWER(color) = ?', [strtolower((string) $property->color)])
+                ->whereHas('item', fn($q) => $q->where('player_id', $player->id))
+                ->with('item')
+                ->get()
+                ->filter(fn(Property $p) => !(method_exists($p, 'isRailroad') && $p->isRailroad()) && !(method_exists($p, 'isUtility') && $p->isUtility()));
+            if ($ownedColorSet->isEmpty()) {
+                throw new \RuntimeException('No buildable properties in this color set');
+            }
+            $maxUnits = (int) $ownedColorSet->map(fn(Property $p) => (int) optional($p->item)->units)->max();
+            if ((int) $property->item->units < $maxUnits) {
+                throw new \RuntimeException('You must sell evenly across the color set');
+            }
+
+            $refund = (int) floor(((int) ($property->unit_price ?? 0)) / 2);
+
+            // Synthetic completed turn for audit
+            $turn = $game->turns()->create([
+                'player_id' => $player->id,
+                'status' => 'completed',
+            ]);
+
+            $tx = $game->transactions()->create([
+                'turn_id' => $turn->id,
+                'status' => 'completed',
+            ]);
+            $tx->items()->create([
+                'game_id' => $game->id,
+                'type' => 'cash',
+                'item_id' => 0,
+                'amount' => $refund,
+                'from_player_id' => null,
+                'to_player_id' => $player->id,
+            ]);
+
+            $player->increment('cash', $refund);
+            $property->item->decrement('units');
+
+            return [
+                'transaction_id' => $tx->id,
+                'property_id' => $property->id,
+                'units' => (int) $property->item->units,
             ];
         });
     }

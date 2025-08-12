@@ -36,7 +36,7 @@ class Game extends Model
 
     public function turns()
     {
-        return $this->hasMany(Turn::class);
+        return $this->hasMany(Turn::class)->latest();
     }
 
     /**

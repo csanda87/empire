@@ -10,6 +10,7 @@ class PlayerAsset extends Model
         'player_id',
         'item_type',
         'item_id',
+        'units',
     ];
 
     public function itemable()
