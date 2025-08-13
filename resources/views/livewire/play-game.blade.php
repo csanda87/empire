@@ -189,11 +189,11 @@
                         <label class="block text-xs text-gray-700 dark:text-gray-300">Properties</label>
                         @php
                             $me = $game->players->firstWhere('user_id', auth()->id());
-                            $ownedProps = $game->board->properties->filter(fn($prop) => optional($prop->item)->player_id === optional($me)->id);
+                            $ownedProps = $game->board->properties->filter(fn($prop) => optional($prop->itemable)->player_id === optional($me)->id);
                             $colorsWithUnits = $ownedProps
                                 ->groupBy('color')
-                                ->filter(function($propsInColor){
-                                    return (int) $propsInColor->sum(fn($p) => (int) optional($p->item)->units) > 0;
+                                ->filter(function($propertiesInColor){
+                                    return (int) $propertiesInColor->sum(fn($p) => (int) optional($p->item)->units) > 0;
                                 })
                                 ->keys()
                                 ->toArray();
@@ -231,10 +231,10 @@
                                     ->reject(fn($p) => $p->id === $me->id)
                                     ->flatMap(function($p) use ($game) {
                                         // Exclude any property whose owner has units on that color
-                                        $ownerOwnedProps = $game->board->properties->filter(fn($prop) => optional($prop->item)->player_id === $p->id);
+                                        $ownerOwnedProps = $game->board->properties->filter(fn($prop) => optional($prop->itemable)->player_id === $p->id);
                                         $colorsWithUnits = $ownerOwnedProps
                                             ->groupBy('color')
-                                            ->filter(fn($propsInColor) => (int) $propsInColor->sum(fn($x) => (int) optional($x->item)->units) > 0)
+                                            ->filter(fn($propertiesInColor) => (int) $propertiesInColor->sum(fn($x) => (int) optional($x->item)->units) > 0)
                                             ->keys()
                                             ->toArray();
                                         return $p->assets
@@ -467,11 +467,11 @@
                         @php
                             $propertyGroups = $player->assets
                                 ->where('itemable_type', 'App\\Models\\Property')
-                                ->map(fn($a) => $a->itemable)
+                                // ->map(fn($a) => $a->itemable)
                                 ->filter()
-                                ->groupBy('color');
+                                ->groupBy('itemable.color');
                         @endphp
-                        @forelse ($propertyGroups as $color => $props)
+                        @forelse ($propertyGroups as $color => $properties)
                             <div class="mt-2">
                                 <div class="flex items-center gap-2">
                                     <span class="inline-block size-3 rounded" style="background: {{ $color }}"></span>
@@ -483,24 +483,19 @@
                                         $viewer = $game->players->firstWhere('user_id', auth()->id());
                                         $ownsFullSet = false;
                                         if ($viewer) {
-                                            $colorProps = $game->board->properties->where('color', $color);
-                                            $ownedCount = $colorProps->filter(fn($prop) => optional($prop->item)->player_id === $viewer->id)->count();
-                                            $ownsFullSet = $ownedCount === $colorProps->count() && $ownedCount > 0;
+                                            $colorProperties = $game->board->properties->where('color', $color);
+                                            $ownsFullSet = $properties->count() === $colorProperties->count() && $properties->count() > 0;
                                         }
                                     @endphp
                                     @php
-                                        // For even-build UI state: compute min/max units among owned properties in this color
-                                        $ownedColorProps = $game->board->properties
-                                            ->where('color', $color)
-                                            ->filter(fn($prop) => optional($prop->item)->player_id === optional($viewer)->id)
-                                            ->values();
-                                        $minUnitsColor = $ownedColorProps->map(fn($prop) => (int) optional($prop->item)->units)->min();
-                                        $maxUnitsColor = $ownedColorProps->map(fn($prop) => (int) optional($prop->item)->units)->max();
+                                        $minUnitsColor = $properties->map->units->min();
+                                        $maxUnitsColor = $properties->map->units->max();
                                     @endphp
-                                    @foreach ($props as $p)
+                                    @foreach ($properties as $property)
                                         <li class="flex items-center gap-2">
-                                            <span>{{ $p->title }}</span>
-                                            @php $units = (int) optional($p->item)->units; @endphp
+                                            <span>{{ $property->itemable->title }}</span>
+
+                                            @php $units = (int) $property->units; @endphp
                                             @if ($units > 0)
                                                 <span class="inline-flex gap-0.5">
                                                     @for ($i = 0; $i < $units; $i++)
@@ -508,43 +503,43 @@
                                                     @endfor
                                                 </span>
                                             @endif
-                                            @if ($game->status !== 'waiting' && $viewer && $viewer->id === optional($p->item)->player_id && $ownsFullSet && $p->supportsUnits())
+                                            @if ($game->status == 'in_progress' && $viewer && $property->player_id === $viewer->id && $ownsFullSet && $property->itemable->supportsUnits())
                                                 <span class="ml-2 inline-flex items-center gap-1">
                                                     <button
                                                         class="px-1.5 py-0.5 text-xs rounded bg-emerald-600 text-white disabled:opacity-50"
-                                                        wire:click="buyUnit({{ $p->id }})"
+                                                        wire:click="buyUnit({{ $property->itemable->id }})"
                                                         @disabled(
-                                                            !$isMyTurn || !$ownsFullSet ||
-                                                            (int) optional($p->item)->units >= 5 ||
-                                                            (int) $viewer->cash < (int) ($p->unit_price ?? 0) ||
-                                                             (int) optional($p->item)->units > (int) $minUnitsColor ||
-                                                             // Disable if property does not support units (missing rent tiers or unit price)
-                                                             (is_callable([$p, 'supportsUnits']) ? !$p->supportsUnits() : false)
+                                                            !$isMyTurn ||
+                                                            (int) $property->units >= 5 ||
+                                                            (int) $viewer->cash < (int) ($property->itemable->unit_price ?? 0) ||
+                                                             (int) $property->units > $minUnitsColor ||
+                                                            // Disable if property does not support units (missing rent tiers or unit price)
+                                                            (is_callable([$property, 'supportsUnits']) ? !$property->itemable->supportsUnits() : false)
                                                         )
-                                                          @if(!is_null($p->unit_price)) title="Buy unit for ${{ (int) $p->unit_price }}" @endif
+                                                          @if(!is_null($property->itemable->unit_price)) title="Buy unit for ${{ (int) $property->itemable->unit_price }}" @endif
                                                     >+ Unit</button>
                                                      <button
                                                         class="px-1.5 py-0.5 text-xs rounded bg-rose-600 text-white disabled:opacity-50"
-                                                        wire:click="sellUnit({{ $p->id }})"
+                                                        wire:click="sellUnit({{ $property->itemable->id }})"
                                                         @disabled(
-                                                            !$isMyTurn || $game->status === 'completed' ||
-                                                            (int) optional($p->item)->units <= 0 ||
-                                                            (int) optional($p->item)->units < (int) $maxUnitsColor
+                                                             !$isMyTurn ||
+                                                             (int) $property->units <= 0 ||
+                                                             (int) $property->units < $maxUnitsColor
                                                         )
-                                                          @if(!is_null($p->unit_price)) title="Sell unit for ${{ (int) floor(((int) $p->unit_price) / 2) }}" @endif
+                                                          @if(!is_null($property->itemable->unit_price)) title="Sell unit for ${{ (int) floor(((int) $property->itemable->unit_price) / 2) }}" @endif
                                                     >- Unit</button>
-                                                    @php $isMortgaged = (bool) optional($p->item)->is_mortgaged; @endphp
+                                                    @php $isMortgaged = (bool) optional($property->itemable)->is_mortgaged; @endphp
                                                     <button
                                                         class="px-1.5 py-0.5 text-xs rounded bg-yellow-600 text-white disabled:opacity-50"
-                                                        wire:click="mortgageProperty({{ $p->id }})"
-                                                        @disabled(!$isMyTurn || $game->status === 'completed' || $isMortgaged || (int) optional($p->item)->units > 0)
-                                                        title="Mortgage for ${{ (int) ($p->mortgage_price ?? 0) }}"
+                                                        wire:click="mortgageProperty({{ $property->itemable->id }})"
+                                                        @disabled(!$isMyTurn || $game->status === 'completed' || $isMortgaged || (int) $property->units > 0)
+                                                        title="Mortgage for ${{ (int) ($property->mortgage_price ?? 0) }}"
                                                     >Mortgage</button>
                                                     <button
                                                         class="px-1.5 py-0.5 text-xs rounded bg-blue-600 text-white disabled:opacity-50"
-                                                        wire:click="unmortgageProperty({{ $p->id }})"
-                                                        @disabled(!$isMyTurn || $game->status === 'completed' || !$isMortgaged || (int) optional($me)->cash < (int) ($p->unmortgage_price ?? 0))
-                                                        title="Unmortgage for ${{ (int) ($p->unmortgage_price ?? 0) }}"
+                                                        wire:click="unmortgageProperty({{ $property->itemable->id }})"
+                                                        @disabled(!$isMyTurn || $game->status === 'completed' || !$isMortgaged || (int) optional($me)->cash < (int) ($property->unmortgage_price ?? 0))
+                                                        title="Unmortgage for ${{ (int) ($property->unmortgage_price ?? 0) }}"
                                                     >Unmortgage</button>
                                                 </span>
                                             @endif
